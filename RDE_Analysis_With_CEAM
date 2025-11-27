@@ -1,0 +1,3746 @@
+function RDE_Analysis_With_CEAM()
+    % Rotating Detonation Engine Analysis using CEAM for Thermodynamics
+    % Based on Mizener & Lu (2017) - Low-Order Parametric Analysis
+    % Uses CEAM (Chemical Equilibrium with Applications for MATLAB)
+    
+    clear; clc; close all;
+    
+    fprintf('RDE Analysis with CEAM Integration\n');
+    fprintf('==================================\n\n');
+    
+    % Get baseline parameters
+    baseline_params = get_baseline_parameters();
+    
+    % Run baseline analysis and validate
+    baseline_results = calculate_rde_performance(baseline_params);
+    
+    validate_baseline_results(baseline_results);
+
+    % % Plot of geometry
+    plot_chamber_geometry(baseline_params);
+    % Graph of inertial velocity on exit plane
+    plot_exit_velocity_profile(baseline_results.exit, baseline_results.flow, baseline_params);
+    % Graph of pressure, temperature and density on exit plane
+    plot_exit_vpt_profiles(baseline_results.exit, baseline_results.flow, baseline_params);
+    % Graph of pressure, temperature and density on inlet plane
+    plot_inlet_vpt_profile(baseline_results.performance, baseline_results.exit, baseline_results.flow, baseline_params);
+    % Graph of Thrust in time
+    plot_thrust_over_time(baseline_results.performance, baseline_params);
+
+    % Run aerospike implementation
+    if baseline_params.nozzle == true
+        aerospike_geom = run_aerospike_implementation(baseline_results);
+        plot_chamber_with_aerospike(aerospike_geom, baseline_params);
+        results = calculate_aerospike_performance(aerospike_geom, baseline_results);
+
+    end
+
+    % Run parametric studies
+    if baseline_params.parametric_analysis == true
+        run_parametric_studies(baseline_params);
+    end
+
+end
+
+function params = get_baseline_parameters()
+    % Baseline design parameters from Table 1 in the paper
+    
+    % Geometric parameters (from paper)
+    params.d_outer = 0.095;      % Outer diameter [m] - Baseline 100mm
+    params.d_inner = 0.080;      % Inner diameter [m] - Baseline 80mm
+    params.L = 0.080;            % Engine length  [m] - Baseline 120mm
+    params.delta_a = (params.d_outer - params.d_inner)/2;  % Baseline 10mm annulus thickness
+    params.r_mean = (params.d_outer + params.d_inner)/4;   % Baseline 45mm mean radius
+    
+    % Define time, L/D, m0 for Breguet Range equation
+    params.time = 120;           % Operating time [s]
+    params.L_D = 7;              % Efficiency
+    params.final_mass = 190;     % [Kg]
+
+
+    params.airbreathing = false;        % if airbreathing = true, if rocket = false
+
+    if params.airbreathing == true
+        
+        % Cruise values
+        params.h_cruise = 20000;           % Cruise altitude [m]
+        params.M_cruise = 4.0;             % Cruise Mach number
+
+        % Evaluation of static parameters from height
+        [T_static_cruise, a_sound, P_static_cruise, rho_static_cruise] = atmosisa(params.h_cruise);
+            
+        params.V_cruise = params.M_cruise * a_sound;
+        gamma_air = 1.4;
+        
+        % Stagnation parameters at cruise
+        params.T0_cruise = T_static_cruise * (1 + (gamma_air - 1)/2 * params.M_cruise^2);                              % [K]
+        params.P0_cruise = P_static_cruise * (1 + (gamma_air - 1)/2 * params.M_cruise^2)^(gamma_air/(gamma_air - 1));  % [Pa]
+        params.rho0_cruise = rho_static_cruise * (1 + (gamma_air - 1)/2 * params.M_cruise^2)^(1/(gamma_air - 1));      % [kg/m³]
+        
+        % Pressure recovery of air inlet using MIL-E-5008B
+        
+        if params.M_cruise < 5
+            params.eta_inlet = 1 - 0.075*( params.M_cruise - 1 )^(1.35);
+
+        elseif params.M_cruise >= 5
+            params.eta_inlet = 800/(params.M_cruise^4 +935);
+
+        end
+        
+        params.T0_inj_ox = params.T0_cruise;      % Injection stagnation temperature [K]
+        params.P0_inj_ox = params.eta_inlet * params.P0_cruise;      % Injection stagnation pressure [Pa]
+        
+        params.inlet_cooling = true;    %true for cooling, false for no cooling
+        if params.inlet_cooling == true
+            % Simulating MIPCC (Pre-cooler effectiveness ~30%)
+            params.T0_inj_ox = params.T0_inj_ox - 250; % Manually lowered T0
+        end
+
+        params.T0_inj_fuel = 290;               
+        params.P0_inj_fuel = 15 * 101325;  
+
+
+        params.P0_inj = params.P0_inj_ox;
+        params.T0_inj = (0.9*params.T0_inj_ox + 0.1*params.T0_inj_fuel);
+        
+        params.P_back = P_static_cruise;       % Back pressure [Pa] - 1 atm
+        params.Xi = 0.25;                      % Injector hole area ratio
+        params.psi_inj = 0;                    % Injection swirl angle [rad]
+
+    elseif params.airbreathing == false
+        
+        % Operating conditions (from paper)
+        params.P0_inj = 10 * 101325;  % Injection stagnation pressure [Pa] - 5 atm
+        params.T0_inj = 300;         % Injection stagnation temperature [K]
+        params.P_back = 101325;      % Back pressure [Pa] - 1 atm
+        3;             % Injector hole area ratio
+        params.psi_inj = 0;          % Injection swirl angle [rad]
+
+        params.P0_inj_ox = params.P0_inj;
+        params.P0_inj_fuel = params.P0_inj;
+
+        params.T0_inj_ox = params.T0_inj;
+        params.T0_inj_fuel = params.T0_inj;
+
+        % Cruise values
+        params.V_cruise = 5000;
+
+   
+    end
+    % Propellant specification
+    params.fuel = 'H2';
+    params.fuel_composition = {'H', 2};    % Store as cell array for fuels not recognised
+    params.oxidizer = 'Air';
+    params.phi = 1.0;                                                            % Equivalence ratio 
+    
+    if strcmpi(params.fuel, 'HTPB') || contains(upper(params.fuel), 'HTPB')
+        % Step 1: Run constant-pressure deflagration at low conditions
+        % Use VERY RICH mixture to gasify the solid HTPB polymer
+        params.P_deflag = 5 * 101325;      % 5 atm in Pa 
+        params.T_deflag = 293.15;          % 293.15 K (low temperature)
+        params.phi_deflag = 8;             % VERY RICH - just to gasify/vaporize HTPB
+        params.fuel_composition = {'C', 3.8462, 'H', 5.8077, 'O', 0.0385};    % Store as cell array for fuels not recognised
+        params.oxidizer = 'Air';
+        % Define composite propellant composition
+        % 40% HTPB by weight
+        params.wtfrac_htpb = 0.4;
+        
+        % 40% Ammonium Perchlorate (AP, NH4ClO4) by weight
+        params.wtfrac_ap = 0.4;
+        
+        % 20% Aluminum by weight
+        params.wtfrac_al = 0.2;
+    end
+
+
+    % Numerical parameters
+    params.epsilon = 1e-9;               % Convergence tolerance
+    params.max_iter = 40;                % Maximum iterations
+    params.g0 = 9.80665;                 % Standard gravity [m/s²]
+    params.alpha = 0.5;                  % Experimental value for determination of psi_sl from psi_det
+   
+    params.validation = false;            % Only for validation against Mizener & Lu (2017) - Low-Order Parametric Analysis
+    params.parametric_analysis = false;   % 'True' For run parametric analysis
+    params.m_e_chamber_corr = true;      % Coefficient for conservation of mass
+    params.nozzle = false;               % 'True'for implementating of an aerospike nozzle
+    params.truncation_percent = 50;      % Percentage of nozzle truncation
+    
+
+    fprintf('Baseline parameters loaded:\n');
+    fprintf('- Geometry: %.0f×%.0f×%.0f mm (outer×inner×length)\n', ...
+            params.d_outer*1000, params.d_inner*1000, params.L*1000);
+    if params.airbreathing == false
+    fprintf('- Operating: %.1f atm, %.0f K, φ=%.2f, Ξ=%.2f\n', ...
+            params.P0_inj/101325, params.T0_inj_ox, params.phi, params.Xi);
+    else
+         fprintf('- Operating: %.1f atm, %.0f K, φ=%.2f, Ξ=%.2f, h=%.0f m, M=%.1f, t=%.1f s\n', ...
+            params.P0_inj/101325, params.T0_inj, params.phi, params.Xi, params.h_cruise, params.M_cruise, params.time);
+    end
+    fprintf('- Propellants: %s/%s\n\n', params.fuel, params.oxidizer);
+end
+
+function results = calculate_rde_performance(params)
+    % Calculate RDE performance using CEAM for thermodynamics
+    
+    % Calculate Chapman-Jouguet detonation properties using CEAM
+    [params, det_props] = calculate_cj_detonation_ceam(params);
+    
+    % Calculate internal flow properties using Sichel-Foster method
+    [flow_props, det_props] = calculate_internal_flow(det_props, params);
+    
+    % Calculate exit conditions and performance
+    exit_props = calculate_exit_conditions(det_props, flow_props, params);
+    performance = calculate_performance_metrics(exit_props, det_props, params, flow_props);
+    
+    % Compile results
+    results = struct();
+    results.detonation = det_props;
+    results.flow = flow_props;
+    results.exit = exit_props;
+    results.performance = performance;
+    results.params = params;
+       
+end
+
+function [params, det_props] = calculate_cj_detonation_ceam(params)
+    % Calculate Chapman-Jouguet detonation properties using CEAM
+    
+    
+    % If HTPB is choosed we use a mixture of HTPB/AP/Al(Cr)=40/40/20 with eq.ratio of 0.1 
+    if strcmpi(params.fuel, 'HTPB') || contains(upper(params.fuel), 'HTPB')
+       
+        [cea_output, P_cr, T_cr] = htpb_calculation(params);
+    
+    % For normal detonation analysis
+    else
+
+        cea_input = CEA('prob', 'det', ...
+                        'phi,eq.ratio', params.phi, ...
+                        't,k', params.T0_inj_ox, ...
+                        'p,atm', params.P0_inj_ox/101325, ...
+                        'reac', ...
+                        'fuel', params.fuel, params.fuel_composition{:}, 'wtfrac',1, 't,k', params.T0_inj_fuel, ...
+                        'oxid', params.oxidizer, 'wtfrac',1, 't,k', params.T0_inj_ox, ...
+                        'output','end','only');
+       
+        gamma_inj = cea_input.output.unburned.gamma;
+        
+        %Assuming choked injection
+        P_cr = params.P0_inj * (2/(gamma_inj + 1))^(gamma_inj/(gamma_inj-1));
+        T_cr = params.T0_inj * (P_cr/params.P0_inj)^((gamma_inj-1)/gamma_inj);
+
+        err = Inf;
+
+        while err > 1e-4
+
+            gamma_old = gamma_inj;
+
+            % Run CEAM detonation calculation with correct syntax
+            cea_output = CEA('prob', 'det', ...
+                             'phi,eq.ratio', params.phi, ...
+                             't,k', T_cr, ...
+                             'p,atm', P_cr/101325, ...
+                             'reac', ...
+                             'fuel', params.fuel, params.fuel_composition{:}, 'wtfrac',1, 't,k', params.T0_inj_fuel, ...
+                             'oxid', params.oxidizer, 'wtfrac',1, 't,k', params.T0_inj_ox, ...
+                             'output','end');
+
+            gamma_inj = cea_output.output.unburned.gamma;
+
+            err = abs(gamma_old - gamma_inj);
+
+            P_cr = params.P0_inj * (2/(gamma_inj + 1))^(gamma_inj/(gamma_inj-1));
+            T_cr = params.T0_inj * (P_cr/params.P0_inj)^((gamma_inj-1)/gamma_inj);
+
+        end
+        
+    end
+
+
+    P_inj = P_cr;
+    T_inj = T_cr;
+ 
+    % Initial state properties
+    P1 = P_inj;
+    T1 = T_inj;
+    
+    % Universal gas constant (J/kg-mol-K)
+    Ru = 8.314462618;                                 % J/mol-K 
+
+    % Calculate initial density using ideal gas law
+    MW_reactants = cea_output.output.unburned.mw;     % g/mol
+    R_reactants = 1000*(Ru / MW_reactants);           % J/kg-K
+    rho1 = P1 / (R_reactants * T1);
+
+    % Use the ratios that actually exist in CEAM output
+    P_ratio = cea_output.output.p_ratio;
+    T_ratio = cea_output.output.t_ratio;
+    rho_ratio = cea_output.output.rho_ratio;
+
+    % Calculate post-detonation properties
+    P2 = P1 * P_ratio;
+    T2 = T1 * T_ratio;
+    rho2 = rho1 * rho_ratio;
+    MW_products = cea_output.output.burned.mw;      % g/mol
+    R_products = 1000*(Ru / MW_products);           % J/kg-K
+    a2 = cea_output.output.burned.sonvel;           % Products speed of sound (m/s)
+
+    % Get detonation velocity directly from CEAM
+    U_cj = cea_output.output.det_vel;
+
+    % Assign to your original variable names
+    gamma2 = cea_output.output.burned.gamma;            % Mixture gamma
+    R2 = R_products;                                    % Mixture gas constant (J/kg-K)
+    
+    % Calculate total pressure from CJ state (M2 = 1)
+    M = 1;
+    P02 = P2 * (1 + 0.5*(gamma2-1)*M^2)^(gamma2/(gamma2-1));
+    T02 = T2 * (1 + 0.5*(gamma2-1)*M^2);
+    rho02 = rho2 * (1 + 0.5*(gamma2-1)*M^2)^(1/(gamma2-1));
+    
+    % Store detonation properties
+    det_props = struct();
+
+    det_props.U_cj = U_cj;
+    det_props.Mach = cea_output.output.mach;
+
+    det_props.P1 = P1;
+    det_props.T1 = T1;
+    det_props.rho1 = rho1;
+    det_props.gamma1 = cea_output.output.unburned.gamma;
+    det_props.R1 = R_reactants;
+    det_props.sonvel1 = cea_output.output.unburned.sonvel;
+
+    det_props.P2 = P2;
+    det_props.P02 = P02;         % Total pressure (stagnation)
+    det_props.T2 = T2;
+    det_props.T02 = T02;
+    det_props.rho2 = rho2;
+    det_props.rho02 = rho02;
+    det_props.gamma2 = gamma2;
+    det_props.gamma_c = gamma2;
+    det_props.R2 = R2;
+    det_props.a2 = a2;
+    det_props.P_ratio = P_ratio;
+    
+    det_props.OFratio = cea_output.output.oxfl;
+
+    fprintf('CJ Detonation Properties:          - CJ Velocity: %.0f m/s     - Pressure ratio: %.1f      - Max Pressure: %.1f atm         - Temperature: %.0f K       - Products gamma: %.3f\n', U_cj, det_props.P_ratio, P2/101325, T2, gamma2);
+end
+
+function [flow_props, det_props] = calculate_internal_flow(det_props, params)
+    % Calculate internal flow using Sichel-Foster method from the paper
+        
+    % Better starting guess for chamber Mach number based on RDE physics
+    gamma_c = det_props.gamma_c;  % Gamma of reactants
+    Mc = 3;
+    
+    % Iterative solution for shock and slip-line angles using improved convergence
+    converged = false;
+    
+    for iter = 1:params.max_iter
+        
+        % Step 1: Calculate Pc_i from Mc_i using isentropic expansion
+        Pc_i = calculate_chamber_pressure_from_mach(Mc, det_props, gamma_c);
+        
+        % Inclination of detonation wave
+        psi_det = calculate_detonation_inclination(params, det_props);
+        det_props.psi_det = psi_det;
+
+        % Step 2: Calculate shock and slip-line angles (Eqs. 6-9)
+        [psi_sh_i, psi_sl_i, M_III_i] = solve_sichel_foster_angles(Mc, det_props, gamma_c, params);
+        
+        % After calculating psi_sh_i and psi_sl_i, apply inclination correction:
+        psi_sh = psi_sh_i + psi_det;                     % Equation 2.15a
+        psi_sl = psi_sl_i + params.alpha * psi_det;               % Equation 2.15b (α=0.5)
+
+        % Step 3: Calculate detonation wave height Λ_i
+        Lambda_i = calculate_detonation_height(psi_sh, psi_sl, params, det_props);
+        
+        % Step 4: Calculate M_2π_i around the annulus using Lambda_i
+        M_2pi_i = calculate_mach_at_2pi(Lambda_i, psi_sh, psi_sl, params, det_props);
+        
+        % Step 5: Define error function according to Eq. 13
+        % f(Mc) = Mc - M_2π  (we want this to be zero)
+        Delta_M = Mc - M_2pi_i;
+        
+        % Check convergence
+        if abs(Delta_M) < params.epsilon
+            converged = true;
+            
+            % psi_sh = 61*pi/180;
+            % psi_sl = 37*pi/180;
+            % Lambda_i = calculate_detonation_height(psi_sh, psi_sl, params, det_props);
+            % M_2pi_i = calculate_mach_at_2pi(Lambda_i, psi_sh, psi_sl, params, det_props);
+
+            Lambda = Lambda_i;
+            M_III = M_III_i;
+            Mc = M_2pi_i;
+            Pc = Pc_i;
+            break;
+        end
+        
+        % Step 6: Apply secant method (Equation 13 from paper)
+        if iter > 1 && ~isempty(Delta_M_old) && abs(Delta_M - Delta_M_old) > 1e-12
+            % Secant method update: Mc_new = Mc - f(Mc) * (Mc - Mc_old) / (f(Mc) - f(Mc_old))
+            Mc_new = Mc - Delta_M * (Mc - Mc_old) / (Delta_M - Delta_M_old);
+            
+            % Update variables for next iteration
+            Mc_old = Mc;        % Store current as old
+            Mc = Mc_new;        % Use new as current
+            Delta_M_old = Delta_M;  % Store current error as old
+            M_2pi_old = M_2pi_i;
+        else
+            % First iteration or fallback: simple step toward target
+            Mc_old = Mc;
+            Mc = Mc - 0.01 * Delta_M;  % Move halfway toward target
+            Delta_M_old = Delta_M;
+            M_2pi_old = M_2pi_i;
+        end
+    end
+    
+    if ~converged
+        error('Internal flow calculation did not converge');
+    end
+    
+    % Calculate remaining properties
+    [psi_A, psi_B, det_props] = calculate_shock_turning_angles(psi_sh, psi_sl, Lambda, params, det_props);
+    theta_in = calculate_injection_point(Lambda, params, det_props, psi_sl);
+    
+    % Store results
+    flow_props = struct();
+    flow_props.psi_sh = psi_sh;
+    flow_props.psi_sl = psi_sl;
+    flow_props.Lambda = Lambda;
+    flow_props.theta_in = theta_in;
+    flow_props.Mc = Mc;
+    flow_props.M_III = M_III;
+    flow_props.psi_A = psi_A;
+    flow_props.psi_B = psi_B;
+    flow_props.converged = converged;
+    
+    fprintf('Internal Flow Properties:          - Shock angle: %.1f°        - Slip-line angle: %.1f°    - Detonation height: %.2f mm        - Chamber Mach: %.3f\n', psi_sh * 180/pi, psi_sl * 180/pi, Lambda * 1000, Mc);
+end
+
+function psi_det = calculate_detonation_inclination(params, det_props)
+    % Calculate detonation wave inclination angle (Equation 2.3 from Mizener & Lu 2017)
+    % The detonation wave inclines due to axial velocity of injected propellants
+    
+    gamma = det_props.gamma1;  % Reactant gamma
+    % Calculate critical injection velocity (choked flow)
+    T_cr = params.T0_inj * (2/(gamma + 1));
+    V_inj = sqrt(gamma * det_props.R1 * T_cr);
+    
+    % Velocity components in noninertial frame upstream of detonation
+    W_Iz = V_inj * cos(params.psi_inj);                         % Axial component
+    W_Itheta = - V_inj * sin(params.psi_inj) + det_props.U_cj;  % Circumferential component
+    
+    % Calculate inclination angle: ψ_det = atan(W_Iz/W_Iθ)
+    psi_det = atan(W_Iz / W_Itheta);
+    % psi_det = 7*pi/180;
+    
+end
+
+function [psi_A, psi_B, det_props] = calculate_shock_turning_angles(psi_sh, psi_sl, Lambda, params, det_props)
+    % Calculate shock turning angles (Section II.C.3 from paper)
+    
+    % Calculate shock exit point (Equation 19)
+    theta_she = (params.L - Lambda) / (params.r_mean * tan(psi_sh));
+    
+    % Calculate impingement angle (Equation 18)
+    psi_A = atan(params.L / (params.r_mean * (theta_she + 2*pi)));
+    
+    % Apply equation 21 for expansion area height
+    zeta_impact = params.r_mean * (theta_she + 2*pi) * tan(psi_sl) - ...
+                  params.r_mean * (theta_she) * tan(0.5*(psi_sh + psi_sl));
+    
+    % Calculate expansion area (Equation 14)
+    A_impact = params.delta_a * zeta_impact;
+    
+    % Calculate sonic area (Equation 17)
+    A_sonic = Lambda * params.delta_a;
+    
+    % Calculate area ratio
+    A_ratio_impact = A_impact / A_sonic;
+    
+    % **FLOW EXPANSION LAWS IMPLEMENTATION**
+    % Calculate Mach number at shock impingement using Mach-area relation (Equation 16)
+    M_A = AR2Mach(A_ratio_impact, det_props.gamma2);
+    
+    % Calculate flow properties at state A by isentropic expansion from detonation state
+    gamma = det_props.gamma2;
+    
+    % Isentropic relations from Chapman-Jouguet conditions (M_CJ = 1)
+    % Temperature ratio (isentropic expansion)
+    T_ratio_A = (1 + 0.5*(gamma-1)*1^2) / (1 + 0.5*(gamma-1)*M_A^2);
+    T_A = det_props.T2 * T_ratio_A;
+    
+    % Pressure ratio (isentropic expansion)  
+    P_ratio_A = T_ratio_A^(gamma/(gamma-1));
+    P_A = det_props.P2 * P_ratio_A;
+    
+    % Density (ideal gas law)
+    rho_A = P_A / (det_props.R2 * T_A);
+    
+    % Speed of sound at state A
+    a_A = sqrt(gamma * det_props.R2 * T_A);
+    
+    % Calculate actual shock angle relative to incoming flow direction
+    beta_shock = psi_sh - psi_A;  % Shock angle relative to incoming flow
+    
+    % Validate shock geometry
+    if abs(beta_shock) < asin(1/M_A)
+        warning('Weak shock condition - beta < Mach angle');
+    end
+    
+    % Normal Mach number using proper shock angle
+    M1n = M_A * sin(beta_shock);
+    
+    % CORRECTED: Theta-beta-Mach relation with proper angle
+    tan_theta = 2*cot(beta_shock) * (M1n^2 - 1) / ...
+                (M_A^2*(gamma + cos(2*beta_shock)) + 2);
+    theta_deflection = atan(tan_theta);
+    
+    % Calculate final flow angle after deflection
+    % Flow turns toward the shock
+    psi_B = psi_A + theta_deflection;  % Flow turns clockwise
+
+    
+    % **OBLIQUE SHOCK PROPERTY CALCULATIONS**
+    % Pressure ratio across oblique shock
+    P_ratio_shock = 1 + (2*gamma)/(gamma+1) * (M1n^2 - 1);
+    P_B = P_A * P_ratio_shock;
+    
+    % Temperature ratio across oblique shock
+    T_ratio_shock = (2*gamma*M1n^2 - (gamma-1)) * (2 + (gamma-1)*M1n^2) / ((gamma+1)^2 * M1n^2);
+    T_B = T_A * T_ratio_shock;
+    
+    % Density ratio across oblique shock
+    rho_ratio_shock = ((gamma+1)*M1n^2) / ((gamma-1)*M1n^2 + 2);
+    rho_B = rho_A * rho_ratio_shock;
+    
+    % Speed of sound downstream of shock
+    a_B = sqrt(gamma * det_props.R2 * T_B);
+    
+    % Calculate downstream normal Mach number
+    M2n_squared = (1+ (gamma-1)/2 * M1n^2) / (gamma*M1n^2 - (gamma-1)/2);
+
+    M2n = sqrt(M2n_squared);
+    
+    % CORRECTED: Downstream Mach number magnitude
+    M_B = M2n / sin(beta_shock - theta_deflection);
+    
+    % Velocity magnitude in noninertial frame downstream of shock
+    W_B_mag = M_B * a_B;
+        
+    % **SONIC AREA FOR TURNED-FLOW REGION**
+    % Calculate stagnation properties downstream of shock for A*_B calculation
+    T0_B = T_B * (1 + 0.5*(gamma-1)*M_B^2);
+    P0_B = P_B * (1 + 0.5*(gamma-1)*M_B^2)^(gamma/(gamma-1));
+   
+
+    % Calculate sonic area for turned-flow region
+    % Using mass flow continuity and choked flow conditions
+    rho0_B = P0_B / (det_props.R2 * T0_B);
+
+    det_props.T0_B = T0_B;
+    det_props.P0_B = P0_B;
+    det_props.rho0_B = rho0_B;
+    
+    a_star_B = sqrt(gamma * det_props.R2 * T0_B / (1 + 0.5*(gamma-1)));
+    
+    % Sonic area for turned-flow region (similar to equation 17 approach)
+    % This represents the effective sonic area for the flow that has passed through the shock
+    A_star_B = (rho_B * W_B_mag) / (rho0_B * a_star_B / sqrt(1 + 0.5*(gamma-1)));
+    
+end
+
+% Area ratio to Mach number
+function M = AR2Mach(Aratio, gamma)
+    % Supersonic root for Aratio >= 1 isentropic A/A* relation
+    if Aratio < 1
+        M = 1;
+    elseif Aratio >= 1
+        gp1 = gamma + 1;
+        gm1 = gamma - 1;
+        tol = 1e-6;
+        % Kneile-style seed expressed in M (keep current approach)
+        r = 1/(Aratio^2); % A*^2 / A^2
+        X = r * (2/gp1) + r * (1 - r) * (1 + gm1/(2*r)); % heuristic seed (kept)
+        Mguess = 1/sqrt(max(X, 1e-12)); % use X ~ 1/M^2 for supersonic
+        
+        
+        for iter = 1:50
+            term = (2 + gm1*Mguess^2)/gp1;
+            Acalc = (1/Mguess) * term^((gp1)/(2*gm1));
+            % Residual: f = A/A* (Aratio) - 1
+            f = (Acalc/Aratio) - 1;
+            if abs(f) < tol
+                M = Mguess;
+                return
+            end
+            % Correct derivative dA/dM: A * (-1/M + (1/M^2-1)/M^2 ...)
+            dfdM = (Acalc) * (-1/Mguess + (gp1*Mguess^2)/(gm1*Mguess^2 + 2)) / Aratio;
+            % Newton step with mild damping and trust bounds
+            step = f/dfdM;
+            Mnew = Mguess - step;
+            if (Mnew < 1.0) || (Mnew > 50.0) || ~isfinite(Mnew)
+                break % fall back to bracketed solve if needed
+            end
+            Mguess = Mnew;
+        end
+        
+        % Fallback to bisection if Newton-Raphson didn't converge
+        Mlow = 1.0001;
+        Mhigh = 50.0;
+        for iter = 1:50
+            Mmid = (Mlow + Mhigh) / 2;
+            term = (2 + gm1*Mmid^2)/gp1;
+            Acalc = (1/Mmid) * term^((gp1)/(2*gm1));
+            if abs(Acalc - Aratio) < tol
+                M = Mmid;
+                return
+            end
+            if Acalc > Aratio
+               Mhigh = Mmid;
+            else
+                Mlow = Mmid;
+            end
+        end
+        M = (Mlow + Mhigh) / 2;
+    end
+end
+
+function M_2pi = calculate_mach_at_2pi(Lambda, ~, psi_sl, params, det_props)
+    % Calculate Mach number at theta = 2π using expansion area
+
+    gamma_c = det_props.gamma_c;
+    % Calculate expansion area at theta = 2π
+    theta_2pi = 2*pi;
+    zeta_2pi = Lambda + params.r_mean * theta_2pi * tan(psi_sl) - Lambda;
+    A_2pi = params.delta_a * zeta_2pi;
+    
+    % Sonic area (detonation wave surface)
+    A_star = Lambda * params.delta_a;
+    
+    % Area ratio
+    A_ratio = A_2pi / A_star;
+    
+    % Solve for Mach number from area ratio
+    if A_ratio > 1
+        M_2pi = AR2Mach(A_ratio, gamma_c);
+    else
+        M_2pi = 1.0;  % Sonic condition
+    end
+end
+
+function [psi_sh, psi_sl, M_III] = solve_sichel_foster_angles(Mc, det_props, gamma_c, params)
+    % Solve Sichel-Foster equations using linspace grid search method
+    
+    % Define bounds
+    psi_a = 40 * pi/180;  % Lower bound
+    psi_b = 80 * pi/180;  % Upper bound
+    
+    % Create grid of psi_sh values
+    n_points = 3000;  % Number of grid points for resolution
+    psi_values = linspace(psi_a, psi_b, n_points);
+    
+    % Evaluate function at all grid points
+    f_values = zeros(size(psi_values));
+    for i = 1:length(psi_values)
+        try
+            [f_values(i), ~, ~] = calculate_pressure_balance_function(psi_values(i), Mc, det_props, gamma_c, params);
+        catch
+            error('Error is Sichel-Foster angle convergence');  % Handle any numerical issues
+        end
+    end
+    
+    % Remove NaN values
+    valid_idx = ~isnan(f_values);
+    psi_valid = psi_values(valid_idx);
+    f_valid = f_values(valid_idx);
+    
+    if length(f_valid) < 2
+        error('Not enough valid function evaluations');
+    end
+    
+    % Find sign changes (zero crossings)
+    sign_changes = find(diff(sign(f_valid)) ~= 0);
+    
+    if isempty(sign_changes)
+        error('No zero crossing found in the specified range');
+    end
+    
+    % Take the first sign change (closest to lower bound)
+    idx = sign_changes(1);
+    
+    % Refine the solution using linear interpolation
+    x1 = psi_valid(idx);
+    x2 = psi_valid(idx+1);
+    f1 = f_valid(idx);
+    f2 = f_valid(idx+1);
+    
+    % Linear interpolation to find zero: x = x1 - f1*(x2-x1)/(f2-f1)
+    if abs(f2 - f1) > 1e-15  % Avoid division by nearly zero
+        psi_sh = x1 - f1 * (x2 - x1) / (f2 - f1);
+    else
+        psi_sh = (x1 + x2) / 2;  % Use midpoint if denominator is too small
+    end
+    
+    % Calculate final values at the interpolated solution
+    [~, psi_sl, M_III] = calculate_pressure_balance_function(psi_sh, Mc, det_props, gamma_c, params);
+end
+
+function [f_val, psi_sl, M_III] = calculate_pressure_balance_function(psi_sh, Mc, det_props, gamma_c, params)
+    % Calculate pressure balance error function
+    
+    psi_det = det_props.psi_det;
+    psi_det = 0.75*psi_det;
+    % Oblique shock relation (Eq. 6)
+    tan_psi_sl = 2 * cot(psi_sh + psi_det) * (Mc^2 * sin(psi_sh + psi_det)^2 - 1) / ...
+                                   (Mc^2 * (gamma_c + cos(2*(psi_sh + psi_det))) + 2);
+    psi_sl = atan(tan_psi_sl) - psi_det;
+
+    % Prandtl-Meyer expansion (Eq. 8)
+    M_III = solve_prandtl_meyer_mach(psi_sl + psi_det, det_props.gamma2);
+
+    % Pressure balance across slip line (Eq. 9)
+    P_ratio_check = check_pressure_balance(Mc, M_III, psi_sh, det_props, gamma_c, params);
+    
+    % Return error function (should be zero at solution)
+    f_val = P_ratio_check - 1;
+end
+
+function P_ratio = check_pressure_balance(Mc, M_III, psi_sh, det_props, gamma_c, params)
+    % Check pressure balance across slip line according to Eq. (9)
+    
+    % Pressure ratio across oblique shock (Eq. 10)
+    P_IV_Pc = 1 + 2*gamma_c/(gamma_c+1) * (Mc^2 * sin(psi_sh)^2 - 1);
+    
+    % Pressure ratio across Prandtl-Meyer expansion (Eq. 11)
+    gamma_II = det_props.gamma2;
+    P_III_PII = (0.5*(gamma_II+1) / (1 + 0.5*(gamma_II-1)*M_III^2))^(gamma_II/(gamma_II-1));
+    
+    % Pressure ratio across detonation
+    P_II_PI = det_props.P_ratio;
+    
+    P_c = calculate_chamber_pressure_from_mach(Mc, det_props, gamma_c); 
+    [P_I, ~, ~, ~] = calculate_injection_conditions(P_c, params, det_props);
+   
+    if P_I == 0 
+        error('No injection');
+    end
+    P_I_P_c = P_I / P_c;
+
+    % Balance check according to Eq. (9): P_IV/P_c = (P_I/P_c) × (P_II/P_I) × (P_III/P_II)
+    % Rearranging: P_IV/P_c / (P_I/P_c × P_II/P_I × P_III/P_II) should equal 1
+    P_ratio = P_IV_Pc / (P_I_P_c * P_II_PI * P_III_PII);
+
+    if P_IV_Pc < 0 || P_III_PII < 0 || P_II_PI < 0
+    % Handle invalid pressure ratios
+        error('One or more pressure ratios are negative');
+    end
+end
+
+function Pc_i = calculate_chamber_pressure_from_mach(Mc, det_props, gamma_c)
+    % Calculate chamber pressure from Mach number using isentropic expansion
+    % This represents Pc(theta=2π) as mentioned in the paper
+    
+    % Isentropic relation: P/P0 = (1 + 0.5*(γ-1)*M²)^(-γ/(γ-1))
+    P_ratio = (1 + 0.5*(gamma_c-1)*Mc^2)^(-gamma_c/(gamma_c-1));
+    
+    % Use detonation total pressure as reference
+    Pc_i = det_props.P02 * P_ratio;
+end
+
+function M_III = solve_prandtl_meyer_mach(nu_target, gamma)
+    % Solve for Mach number from Prandtl-Meyer angle
+    
+    M_III = 1.5;  % Initial guess (supersonic)
+    
+    for iter = 1:40
+        if M_III <= 1.0
+            M_III = 1.0001;
+        end
+        
+        % Prandtl-Meyer function
+        nu_calc = sqrt((gamma+1)/(gamma-1)) * atan(sqrt((gamma-1)/(gamma+1)*(M_III^2-1))) - ...
+                  atan(sqrt(M_III^2-1));
+        
+        if abs(nu_calc - nu_target) < 1e-9
+            break;
+        end
+        
+        % Newton-Raphson update
+        dnu_dM = sqrt(M_III^2-1) / (M_III * (1 + (gamma-1)/2 * M_III^2));
+        M_III = M_III - (nu_calc - nu_target) / dnu_dM;
+    end
+end
+
+function Lambda = calculate_detonation_height(psi_sh, psi_sl, params, det_props)
+    Lambda_old = 0.020;     % First guess
+    Lambda = 0.025;         % Second guess  
+    
+    for iter = 1:params.max_iter
+        l_inj = integrate_injection_velocity(Lambda, psi_sl, params, det_props);
+        error_current = Lambda - l_inj;
+        
+        if abs(error_current) < params.epsilon
+            break;
+        end
+        
+        if iter > 1
+            % Secant method (Equation 2.20)
+            Lambda_new = Lambda - error_current * (Lambda - Lambda_old) / (error_current - error_old);
+            Lambda_old = Lambda;
+            Lambda = Lambda_new;
+            error_old = error_current;
+        else
+            Lambda_old = Lambda;
+            Lambda = Lambda + 0.01 * error_current;  % Small step for second point
+            error_old = error_current;
+        end
+    end
+end
+
+function l_inj = integrate_injection_velocity(Lambda, psi_sl, params, det_props)
+    % Numerical integration of injection velocity around annulus with proper injection calculation
+    theta_in = calculate_injection_point(Lambda, params, det_props, psi_sl);
+    theta = linspace(0, 2*pi, 3000);
+    V_inj_z = zeros(size(theta));
+    
+    for i = 1:length(theta)
+        % Calculate chamber pressure at this location
+        zeta = calculate_expansion_height(theta(i), Lambda, psi_sl, theta_in, params); 
+        A_local = params.delta_a * zeta;
+        A_ratio = A_local / (Lambda * params.delta_a);
+        
+        if A_ratio > 1
+            M_local = AR2Mach(A_ratio, det_props.gamma2);
+            
+            % Calculate local chamber pressure
+            P_c_local = calculate_chamber_pressure_from_mach(M_local, det_props, det_props.gamma2);
+            
+            % Calculate injection conditions
+            [~, ~, V_inj_local, ~] = calculate_injection_conditions(P_c_local, params, det_props);
+            V_inj_z(i) = V_inj_local * cos(params.psi_inj);
+        elseif A_ratio < 1
+            V_inj_z(i) = 0;
+        end
+    end
+    
+    % Integration to find injection distance
+    l_inj = trapz(theta, V_inj_z) / (2*pi) * (2*pi/det_props.U_cj * params.r_mean);
+end
+
+function theta_in = calculate_injection_point(Lambda, params, det_props, psi_sl)
+    % More robust root-finding using Brent's method
+    
+    % Define the function whose root we want to find
+    pressure_diff = @(theta) calculate_chamber_pressure_at_theta(theta, Lambda, params, det_props, psi_sl) - params.P0_inj;
+    
+    % Find brackets where function changes sign
+    theta_a = 0;
+    theta_b = 2*pi-0.1;
+    
+    % Ensure we have proper brackets
+    fa = pressure_diff(theta_a);
+    fb = pressure_diff(theta_b);
+    
+    if fa * fb > 0
+        % No sign change - use fallback
+        warning('No valid theta_in'); % Reasonable guess
+    else
+        % Use MATLAB's built-in root finder (implements Brent's method)
+    
+        theta_in = fzero(pressure_diff, [theta_a, theta_b]);
+    end
+end
+
+function P_c_local = calculate_chamber_pressure_at_theta(theta, Lambda, params, det_props, psi_sl)
+    % Calculate chamber pressure at given theta using proper expansion relations
+    
+    % Calculate expansion area height (before injection begins)
+    zeta_local = Lambda + params.r_mean * theta * tan(psi_sl);
+    A_local = params.delta_a * zeta_local;
+    A_ratio = A_local / (Lambda * params.delta_a);
+    
+    if A_ratio >= 1
+        % Proper expansion flow
+        M_local = AR2Mach(A_ratio, det_props.gamma2);
+        
+        % Isentropic relations for pressure
+        T_ratio = 1 / (1 + 0.5*(det_props.gamma2-1)*M_local^2);
+        P_ratio = T_ratio^(det_props.gamma2/(det_props.gamma2-1));
+        P_c_local = det_props.P02 * P_ratio;
+    else
+        % At or near the throat - use stagnation conditions
+        P_c_local = det_props.P02;
+    end
+end
+
+function zeta = calculate_expansion_height(theta, Lambda, psi_sl, theta_in, params)
+    % Calculate expansion area height according to Eq. (15) from paper
+    
+    if theta <= theta_in && theta >= 0
+        % Region 1: Before injection begins
+        zeta = Lambda + params.r_mean * theta * tan(psi_sl);
+    elseif theta <= 2*pi && theta > theta_in
+        % Region 2: After injection begins
+        zeta = Lambda + params.r_mean * theta * tan(psi_sl) - ...
+               Lambda * (theta - theta_in) / (2*pi - theta_in);
+    
+    else
+        error('Theta out of range');
+    end
+end
+
+function [P_inj, T_inj, V_inj, regime] = calculate_injection_conditions(P_c, params, det_props)
+    % Calculate injection conditions according to Section II.B
+    
+    % Calculate critical pressure (Eq. 3)
+    gamma_inj = det_props.gamma1;
+    P_cr = params.P0_inj * (2/(gamma_inj + 1))^(gamma_inj/(gamma_inj-1)); 
+    
+    if P_c >= params.P0_inj 
+        % Regime A: No injection
+        P_inj = 0;
+        T_inj = 0;
+        V_inj = 0;
+        regime = 'A';
+        
+    elseif P_c > P_cr && P_c < params.P0_inj
+        % Regime B: Subsonic injection
+        P_inj = P_c;
+        T_inj = params.T0_inj * (P_inj/params.P0_inj)^((gamma_inj-1)/gamma_inj);  % Eq. (4)
+        V_inj = sqrt(2*gamma_inj/(gamma_inj-1) * det_props.R1 * params.T0_inj * ...  % Eq. (5)
+                     (1 - (P_inj/params.P0_inj)^((gamma_inj-1)/gamma_inj)));
+        regime = 'B';
+        
+    elseif P_c <= P_cr
+        % Regime C: Sonic injection
+        P_inj = P_cr;
+        T_inj = params.T0_inj * (P_inj/params.P0_inj)^((gamma_inj-1)/gamma_inj);  % Eq. (4)
+        V_inj = sqrt(2*gamma_inj/(gamma_inj-1) * det_props.R1 * params.T0_inj * ...  % Eq. (5)
+                     (1 - (P_inj/params.P0_inj)^((gamma_inj-1)/gamma_inj)));
+        regime = 'C';
+    end
+end
+
+
+function exit_props = calculate_exit_conditions(det_props, flow_props, params)
+
+    if params.m_e_chamber_corr == false
+        % Calculate exit conditions using expansion model
+        
+        % Exit points (Eqs. 19-20)
+        theta_sle = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sl));
+        theta_she = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sh));
+        
+        % Exit plane discretization
+        theta_exit = linspace(theta_sle, theta_sle + 2*pi, 3000);
+        n_points = length(theta_exit);
+        
+        % Initialize arrays
+        exit_props = struct();
+        exit_props.theta = theta_exit;
+        exit_props.Vz = zeros(size(theta_exit));
+        exit_props.Vtheta = zeros(size(theta_exit));
+        exit_props.P = zeros(size(theta_exit));
+        exit_props.rho = zeros(size(theta_exit));
+        exit_props.T = zeros(size(theta_exit));
+        exit_props.T0 = zeros(size(theta_exit));
+        exit_props.P0 = zeros(size(theta_exit));    
+        exit_props.rho0 = zeros(size(theta_exit));
+        exit_props.psi_exit = zeros(size(theta_exit));
+    
+        for i = 1:n_points
+            theta_i = theta_exit(i);
+    
+            % Calculate expansion area at exit (Eq. 21) 
+            zeta_exit = calculate_exit_area_height(theta_i, theta_sle, theta_she, flow_props, params);
+            
+            A_exit = params.delta_a * zeta_exit;
+            A_ratio = A_exit / (flow_props.Lambda * params.delta_a);
+            
+            % Calculate Mach number
+            M_exit = AR2Mach(A_ratio, det_props.gamma2);
+    
+            % Calculate thermodynamic properties using isentropic relations
+            T_ratio = 1 / (1 + 0.5*(det_props.gamma2-1)*M_exit^2);
+            P_ratio = (1 + 0.5*(det_props.gamma2-1)*M_exit^2)^(-det_props.gamma2/(det_props.gamma2-1));
+            rho_ratio = (1 + 0.5*(det_props.gamma2-1)*M_exit^2)^(-1/(det_props.gamma2-1));
+    
+    
+            if theta_i <= theta_she + 2*pi
+                exit_props.T0(i) = det_props.T02;
+                exit_props.P0(i) = det_props.P02;
+                exit_props.rho0(i) = det_props.rho02;
+    
+            elseif theta_i > theta_she + 2*pi && theta_i <= theta_sle + 2*pi
+    
+                coefficient = (theta_i - (theta_she + 2*pi)) / ((theta_sle + 2*pi) - (theta_she + 2*pi));
+               
+                exit_props.T0(i) = det_props.T0_B + coefficient * (det_props.T02 - det_props.T0_B);
+                exit_props.P0(i) = det_props.P0_B + coefficient * (det_props.P02 - det_props.P0_B);
+                exit_props.rho0(i) = det_props.rho0_B + coefficient * (det_props.rho02 - det_props.rho0_B);
+            end
+    
+            exit_props.T(i) = exit_props.T0(i) * T_ratio;
+            exit_props.P(i) = exit_props.P0(i) * P_ratio;
+            exit_props.rho(i) = exit_props.rho0(i) * rho_ratio;
+    
+            % Calculate velocity components
+            a_exit = sqrt(det_props.gamma2 * det_props.R2 * exit_props.T(i));
+            V_mag = M_exit * a_exit;
+            
+            exit_props.M_exit(i) = M_exit;
+            
+            % Flow angle calculation (Eq. 22) 
+            exit_props.psi_exit(i) = calculate_exit_flow_angle(theta_i, theta_sle, theta_she, flow_props);
+            
+            % Velocity components in noninertial frame
+            Wz = V_mag * sin(exit_props.psi_exit(i));
+            Wtheta = V_mag * cos(exit_props.psi_exit(i));
+            
+            % Galilean transformation to inertial frame (Eq. 1)
+            exit_props.Vz(i) = Wz;
+            exit_props.Vtheta(i) = Wtheta - det_props.U_cj;
+        end
+    end
+    if params.m_e_chamber_corr == true
+        % Iterative coefficient adjustment
+        coeff = 1.0;           % Initial coefficient
+        tolerance = 1e-3;      % Convergence tolerance (0.01%)
+        max_iter = 40;
+        damping = 0.25;         % Damping factor
+        
+        % fprintf('\n Iterative mass flow matching\n');
+        exit_props_temp = calculate_exit_internal(det_props, flow_props, params, coeff);
+        mdot1_inj = exit_props_temp.mass_flow_inj;
+        
+        for iter = 1:max_iter
+            
+            % Calculate exit properties with current coefficient
+            exit_props_temp = calculate_exit_internal(det_props, flow_props, params, coeff);
+            
+            % Extract mass flows
+            mdot_exit = exit_props_temp.mass_flow_exit;
+            mdot_inj = exit_props_temp.mass_flow_inj;
+            
+            % Calculate error
+            error_percent = 100 * (mdot_exit - mdot1_inj) / mdot1_inj;
+            
+            % fprintf('Iter %2d: coeff = %.6f | mdot_inj = %.6f | mdot_exit = %.6f | error = %+.4f%%\n', ...
+            %     iter, coeff, mdot_inj, mdot_exit, error_percent);
+            % 
+            % Check convergence
+            if abs(error_percent) < tolerance * 100
+                % fprintf('Converged, final coefficient = %.6f\n\n', coeff);
+                exit_props = exit_props_temp;
+                exit_props.mass_flow_inj = mdot1_inj;
+                return;
+            end
+            
+            % Update coefficient
+            delta_coeff = damping * error_percent / 100;
+            coeff_new = coeff * (1 + delta_coeff);
+            
+            % Bounds to prevent instability
+            coeff_new = max(0,coeff_new);
+            
+            coeff = coeff_new;
+        end
+        
+        warning('Mass flow matching did not converge after %d iterations', max_iter);
+        exit_props = exit_props_temp;
+    end
+
+end
+
+function exit_props = calculate_exit_internal(det_props, flow_props, params, coeff)
+    % Calculate exit conditions using expansion model WITH COEFFICIENT
+    
+    % Exit points (Eqs. 19-20)
+    theta_sle = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sl));
+    theta_she = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sh));
+    
+    % Exit plane discretization
+    theta_exit = linspace(theta_sle, theta_sle + 2*pi, 3000);
+    n_points = length(theta_exit);
+    
+    % Initialize arrays
+    exit_props = struct();
+    exit_props.theta = theta_exit;
+    exit_props.Vz = zeros(size(theta_exit));
+    exit_props.Vtheta = zeros(size(theta_exit));
+    exit_props.P = zeros(size(theta_exit));
+    exit_props.rho = zeros(size(theta_exit));
+    exit_props.T = zeros(size(theta_exit));
+    exit_props.T0 = zeros(size(theta_exit));
+    exit_props.P0 = zeros(size(theta_exit));
+    exit_props.rho0 = zeros(size(theta_exit));
+    exit_props.psi_exit = zeros(size(theta_exit));
+    exit_props.M_exit = zeros(size(theta_exit));
+    
+    for i = 1:n_points
+        theta_i = theta_exit(i);
+    
+        % Calculate expansion area at exit (Eq. 21)
+        zeta_exit = calculate_exit_area_height(theta_i, theta_sle, theta_she, flow_props, params);
+    
+        A_exit = params.delta_a * zeta_exit;
+        A_ratio = A_exit / (flow_props.Lambda * params.delta_a);
+    
+        % ============================================================
+        % APPLY COEFFICIENT HERE - KEY CHANGE
+        % ============================================================
+        M_exit_base = AR2Mach(A_ratio, det_props.gamma2);
+        M_exit = coeff * M_exit_base;  % APPLY COEFFICIENT
+        % ============================================================
+    
+        exit_props.M_exit(i) = M_exit;
+    
+        % Calculate thermodynamic properties using isentropic relations
+        T_ratio = 1 / (1 + 0.5*(det_props.gamma2-1)*M_exit^2);
+        P_ratio = (1 + 0.5*(det_props.gamma2-1)*M_exit^2)^(-det_props.gamma2/(det_props.gamma2-1));
+        rho_ratio = (1 + 0.5*(det_props.gamma2-1)*M_exit^2)^(-1/(det_props.gamma2-1));
+    
+        if theta_i <= theta_she + 2*pi
+            exit_props.T0(i) = det_props.T02;
+            exit_props.P0(i) = det_props.P02;
+            exit_props.rho0(i) = det_props.rho02;
+    
+        elseif theta_i > theta_she + 2*pi && theta_i <= theta_sle + 2*pi
+    
+            coefficient = (theta_i - (theta_she + 2*pi)) / ((theta_sle + 2*pi) - (theta_she + 2*pi));
+    
+            exit_props.T0(i) = det_props.T0_B + coefficient * (det_props.T02 - det_props.T0_B);
+            exit_props.P0(i) = det_props.P0_B + coefficient * (det_props.P02 - det_props.P0_B);
+            exit_props.rho0(i) = det_props.rho0_B + coefficient * (det_props.rho02 - det_props.rho0_B);
+        end
+    
+        exit_props.T(i) = exit_props.T0(i) * T_ratio;
+        exit_props.P(i) = exit_props.P0(i) * P_ratio;
+        exit_props.rho(i) = exit_props.rho0(i) * rho_ratio;
+    
+        % Calculate velocity components
+        a_exit = sqrt(det_props.gamma_c * det_props.R2 * exit_props.T(i));
+        V_mag = M_exit * a_exit;
+    
+        % Flow angle calculation (Eq. 22)
+        exit_props.psi_exit(i) = calculate_exit_flow_angle(theta_i, theta_sle, theta_she, flow_props);
+    
+        % Velocity components in noninertial frame
+        Wz = V_mag * sin(exit_props.psi_exit(i));
+        Wtheta = V_mag * cos(exit_props.psi_exit(i));
+    
+        % Galilean transformation to inertial frame (Eq. 1)
+        exit_props.Vz(i) = Wz;
+        exit_props.Vtheta(i) = Wtheta - det_props.U_cj;
+    end
+    
+    % =================================================================
+    % CALCULATE MASS FLOWS
+    % =================================================================
+    
+    % Mass flow at exit
+    theta = exit_props.theta;
+    integrand_exit = exit_props.rho .* exit_props.Vz;
+    exit_props.mass_flow_exit = params.delta_a * params.r_mean * params.Xi * trapz(theta, integrand_exit);
+    
+    % Mass flow at injection
+    theta_inj = linspace(0, 2*pi, 3000);
+    rho_inj = zeros(size(theta_inj));
+    Vz_inj = zeros(size(theta_inj));
+    P_inj = zeros(size(theta_inj));
+    T_inj = zeros(size(theta_inj));
+    
+    for i = 1:length(theta_inj)
+        theta_i = theta_inj(i);
+    
+        % Calculate local chamber pressure
+        zeta_local = calculate_expansion_height(theta_i, flow_props.Lambda, flow_props.psi_sl, flow_props.theta_in, params);
+        A_local = params.delta_a * zeta_local;
+        A_ratio = A_local / (params.delta_a * flow_props.Lambda);
+    
+        if A_ratio >= 1
+            Mc = AR2Mach(A_ratio, det_props.gamma2);
+            P_c_local = calculate_chamber_pressure_from_mach(Mc, det_props, det_props.gamma2);
+    
+            [P_inj(i), T_inj(i), V_inj, regime] = calculate_injection_conditions(P_c_local, params, det_props);
+    
+            if strcmp(regime, 'A')
+                rho_inj(i) = 0;
+                Vz_inj(i) = 0;
+            else
+                rho_inj(i) = P_inj(i) / (det_props.R1 * T_inj(i));
+                Vz_inj(i) = V_inj * cos(params.psi_inj);
+            end
+        else
+            rho_inj(i) = 0;
+            Vz_inj(i) = 0;
+        end
+    end
+    
+    exit_props.mass_flow_inj = params.delta_a * params.r_mean * params.Xi * trapz(theta_inj, rho_inj .* Vz_inj);
+end
+
+% Exit area calculation
+function zeta_exit = calculate_exit_area_height(theta_i, theta_sle, theta_she, flow_props, params)
+    
+    theta_in = flow_props.theta_in;
+
+    if theta_i <= theta_in 
+        % Region 1: Before injection begins
+        zeta_exit = flow_props.Lambda + params.r_mean * theta_i * tan(flow_props.psi_sl);
+    elseif theta_i <= 2*pi && theta_i >= theta_in
+        % Region 2: After injection begins
+        zeta_exit = flow_props.Lambda + params.r_mean * theta_i * tan(flow_props.psi_sl) - ...
+               flow_props.Lambda * (theta_i - theta_in) / (2*pi - theta_in);
+    elseif theta_i > 2*pi && theta_i <= theta_she + 2*pi
+        % Region 3: Between 2π and shock exit point
+        zeta_exit = params.r_mean * theta_i * tan(flow_props.psi_sl) - ...
+                   params.r_mean * (theta_i - 2*pi) * tan(0.5 * (flow_props.psi_sh + flow_props.psi_sl));
+    elseif theta_i > theta_she + 2*pi && theta_i <= theta_sle + 2*pi
+        % Region 4: Between shock exit and slip-line exit
+        zeta_exit = params.r_mean * (theta_i - 2*pi) * (tan(flow_props.psi_sh) - tan(flow_props.psi_sl));
+    else
+        error('theta_i outside valid range for exit area calculation');
+    end
+end
+
+% Flow angle calculation
+function psi_exit = calculate_exit_flow_angle(theta_i, theta_sle, theta_she, flow_props)
+    
+    % Default to slip-line value
+    psi_exit = flow_props.psi_sl;
+    
+    % Region 3: θsle < θ ≤ θshe + 2π
+    if theta_i > theta_sle && theta_i <= (theta_she + 2*pi)
+        psi_exit = flow_props.psi_sl + (theta_i - theta_sle) * ...
+                                       (flow_props.psi_A - flow_props.psi_sl)/ ((theta_she + 2*pi) - theta_sle);
+    end
+    % Region 4: θshe + 2π < θ ≤ θsle + 2π
+    if theta_i > (theta_she + 2*pi) && theta_i <= (theta_sle + 2*pi)
+        psi_exit = flow_props.psi_B + (theta_i - theta_she - 2*pi) * ...
+                                      (flow_props.psi_B - flow_props.psi_sl) / (theta_she - theta_sle);
+    end
+end
+
+function performance = calculate_performance_metrics(exit_props, det_props, params, flow_props)
+    % Calculate performance metrics (Eqs. 31-37)
+    
+    theta = exit_props.theta;
+
+    % Mass flow rate
+    mass_flow_exit = params.delta_a * params.r_mean * params.Xi * ...
+        trapz(theta, exit_props.rho .* exit_props.Vz);
+
+    % Define theta range for injection plane
+    theta_inj = linspace(0, 2*pi, 3000);
+
+    % Initialize arrays for density and axial velocity at injection plane
+    rho_inj = zeros(size(theta_inj));
+    Vz_inj = zeros(size(theta_inj));
+    P_inj = zeros(size(theta_inj));
+    T_inj = zeros(size(theta_inj));
+    for i = 1:length(theta_inj)
+        theta_i = theta_inj(i);
+
+        % Calculate local chamber pressure and other properties at injection plane
+        zeta_local = calculate_expansion_height(theta_i, flow_props.Lambda, flow_props.psi_sl, flow_props.theta_in, params);
+        A_local = params.delta_a * zeta_local;
+        A_ratio = A_local / (params.delta_a * flow_props.Lambda);
+
+        if A_ratio >= 1
+            Mc = AR2Mach(A_ratio, det_props.gamma_c);
+            P_c_local = calculate_chamber_pressure_from_mach(Mc, det_props, det_props.gamma_c);
+            
+            % Calculate injection conditions at this point
+            [P_inj(i), T_inj(i), V_inj, regime] = calculate_injection_conditions(P_c_local, params, det_props);
+            
+            if strcmp(regime, 'A')
+                rho_inj(i) = 0;
+                Vz_inj(i) = 0;
+            elseif strcmp(regime, 'B') || strcmp(regime, 'C')
+                rho_inj(i) = P_inj(i) / (det_props.R1 * T_inj(i));
+                Vz_inj(i) =  V_inj * cos(params.psi_inj);
+            end
+        else
+            rho_inj(i) = 0;
+            Vz_inj(i) = 0;
+        end
+    end
+
+    % Calculate injection mass flow
+    mass_flow_inj = params.delta_a * params.r_mean * params.Xi * trapz(theta_inj, rho_inj .* Vz_inj);
+    
+    % Axial momentum equation (Eq. 31)
+    integrand_z_exit = exit_props.rho .* exit_props.Vz.^2 + ...
+                  (exit_props.P - params.P_back);
+
+    Fz = params.delta_a * params.r_mean * params.Xi * trapz(theta, integrand_z_exit) ;
+    
+    %Total Impulse
+    I_tot = Fz * params.time;
+    
+    % Circumferential momentum equation (Eq. 32)
+    integrand_theta = exit_props.rho .* exit_props.Vz .* exit_props.Vtheta;
+    Ftheta = params.delta_a * params.r_mean * params.Xi * trapz(theta, integrand_theta);
+   
+    
+    % Mass flow of fuel and oxidizer 
+    mass_flow_fuel = mass_flow_inj / (1 + det_props.OFratio);
+    mass_flow_oxidizer = mass_flow_inj - mass_flow_fuel;
+    % Total mass of fuel
+    mass_fuel = mass_flow_fuel * params.time;
+    mass_oxidizer = (mass_flow_inj * params.time) - mass_fuel;
+    % Mean exit swirl angle (Eq. 37)
+    Vz_mean = mean(exit_props.Vz);
+    Vtheta_mean = mean(exit_props.Vtheta);
+    mean_exit_swirl_angle = atan(Vtheta_mean / Vz_mean) * 180/pi;
+
+    % Specific Impulse
+    Isp_z = Fz / (mass_flow_inj * params.g0);
+    Isp_f = sqrt(Fz^2 + Ftheta^2) / (mass_flow_fuel * params.g0);
+
+    % Breguet Range
+    range_breguet = (params.V_cruise) * params.L_D * Isp_f * log((params.final_mass+mass_fuel)/(params.final_mass)); %[m]
+    range_tsiolkovsky = params.V_cruise^2/params.g0; % [m]
+
+    % Performance metrics
+    performance = struct();
+    performance.thrust = Fz;                                    % Thrust                [N]
+    performance.Vz_inj = Vz_inj;
+    performance.P_inj = P_inj;
+    performance.T_inj = T_inj;
+    performance.rho_inj = rho_inj;
+    performance.circumferential_force = Ftheta;                 % Circumferential force [N]
+    performance.torque = params.r_mean * Ftheta;                % Torque                [N·m]
+    performance.mass_flow_exit = mass_flow_exit;                % Mass flow rate        [kg/s]
+    performance.mass_flow_inj = mass_flow_inj;                  % Mass flow rate        [kg/s]
+    performance.mass_flow_fuel = mass_flow_fuel;                % Mass flow rate        [kg/s]
+    performance.mass_flow_oxidizer = mass_flow_oxidizer;        % Mass flow rate        [kg/s]
+    performance.mass_fuel = mass_fuel;                          % Mass                  [kg]
+    performance.mass_oxidizer = mass_oxidizer;                  % Mass                  [kg]
+    performance.Isp_z = Isp_z;       % Z-specific impulse    [s]
+    performance.I_tot = I_tot;                                  % Total Impulse         [N·s]
+    performance.Isp_f = Isp_f;
+    performance.relative_force_ratio = 1 - abs((Ftheta/Fz));          % Eq. 33
+    performance.mean_exit_swirl_angle = mean_exit_swirl_angle;
+    performance.range_breguet = range_breguet/1000;             % [Km]
+    performance.range_tsiolkovsky = range_tsiolkovsky/1000;     % [Km]
+
+    
+    fprintf('Performance Metrics Calculated:    - Thrust: %.1f N          - Torque: %.2f N·m,        - Isp_z: %.1f s,                    - Isp_f: %.1f s\n\n', performance.thrust, performance.torque, performance.Isp_z, performance.Isp_f);
+end
+
+function validate_baseline_results(results)
+
+    
+    if results.params.validation == true
+        % Validate against Table 1 from the paper
+    
+        fprintf('Validation against Table 1 (Mizener & Lu 2017):\n');
+        fprintf('========================================================\n');
+    
+        % Expected values from Table 1
+        expected = struct();
+        expected.thrust = 1890;      % N
+        expected.circ_force = 127;   % N
+        expected.torque = 5.74;      % N·m
+        expected.rel_ratio = 0.933;  % -
+        expected.Isp_z = 313;        % s
+        expected.Isp_f = 2800;       % s
+        expected.height = 25.04;      % mm
+        expected.mass_flow = 0.617;  % kg/s
+        expected.swirl = 6.73;       % deg
+    
+    
+        % Calculate relative errors
+        perf = results.performance;
+        flow = results.flow;
+    
+        error_thrust = abs(perf.thrust - expected.thrust) / expected.thrust * 100;
+        error_torque = abs(perf.torque - expected.torque) / expected.torque * 100;
+        error_Isp_z = abs(perf.Isp_z - expected.Isp_z) / expected.Isp_z * 100;
+        error_Isp_f = abs(perf.Isp_f - expected.Isp_f) / expected.Isp_f * 100;
+        error_height = abs(flow.Lambda*1000 - expected.height) / expected.height * 100;
+    
+        fprintf('Parameter                 Calculated    Expected     Error\n');
+        fprintf('--------------------------------------------------------\n');
+        fprintf('Thrust [N]                  %8.1f    %8.1f    %5.1f%%\n', perf.thrust, expected.thrust, error_thrust);
+        fprintf('Circ. Force [N]             %8.1f    %8.1f    %5.1f%%\n', perf.circumferential_force, expected.circ_force, abs(perf.circumferential_force - expected.circ_force) / expected.circ_force * 100);
+        fprintf('Torque [N·m]                %8.2f    %8.2f    %5.1f%%\n', perf.torque, expected.torque, error_torque);
+        fprintf('Rel. Force Ratio            %8.3f    %8.3f    %5.1f%%\n', perf.relative_force_ratio, expected.rel_ratio, abs(perf.relative_force_ratio - expected.rel_ratio) / expected.rel_ratio * 100);
+        fprintf('Isp_z [s]                   %8.1f    %8.1f    %5.1f%%\n', perf.Isp_z, expected.Isp_z, error_Isp_z);
+        fprintf('Isp_f [s]                   %8.1f    %8.1f    %5.1f%%\n', perf.Isp_f, expected.Isp_f, error_Isp_f);
+        fprintf('Det. Height [mm]            %8.2f    %8.2f    %5.1f%%\n', flow.Lambda*1000, expected.height, error_height);
+        fprintf('Mass Flow Injection [kg/s]  %8.3f    %8.3f    %5.1f%%\n', perf.mass_flow_inj, expected.mass_flow, abs(perf.mass_flow_inj - expected.mass_flow) / expected.mass_flow * 100);
+        fprintf('Mass Flow Exit [kg/s]       %8.3f    %8.3f    %5.1f%%\n', perf.mass_flow_exit, expected.mass_flow, abs(perf.mass_flow_exit - expected.mass_flow) / expected.mass_flow * 100);
+        fprintf('Exit Swirl [deg]            %8.2f    %8.2f    %5.1f%%\n', perf.mean_exit_swirl_angle, expected.swirl, abs(perf.mean_exit_swirl_angle - expected.swirl) / expected.swirl * 100);
+        fprintf('\n');
+    
+    elseif results.params.validation == false
+    
+        % Show performance parameters
+    
+        fprintf('Performance parameters:\n');
+        fprintf('====================================\n');
+    
+        % Calculate relative errors
+        perf = results.performance;
+        flow = results.flow;
+    
+    
+        fprintf('Parameter                      Calculated\n');
+        fprintf('-----------------------------------------\n');
+        fprintf('Thrust [N]                        %8.1f   \n', perf.thrust);
+        fprintf('Circ. Force [N]                   %8.1f   \n', perf.circumferential_force);
+        fprintf('Torque [N·m]                      %8.2f   \n', perf.torque);
+        fprintf('Rel. Force Ratio                  %8.3f   \n', perf.relative_force_ratio);
+        fprintf('Det. Height [mm]                  %8.2f   \n', flow.Lambda*1000);
+        fprintf('Isp_z [s]                         %8.1f   \n', perf.Isp_z);
+        fprintf('Isp_f [s]                         %8.1f   \n', perf.Isp_f);
+        fprintf('I_tot [N·s]                       %8.1f   \n', perf.I_tot);
+        fprintf('Mass Flow Fuel (of Isp_f) [kg/s]  %8.3f   \n', perf.mass_flow_fuel);
+        fprintf('Mass Flow Oxidier [kg/s]          %8.3f   \n', perf.mass_flow_oxidizer);
+        fprintf('Mass Flow Injection [kg/s]        %8.3f   \n', perf.mass_flow_inj);
+        fprintf('Mass Flow Exit [kg/s]             %8.3f   \n', perf.mass_flow_exit);
+        fprintf('Mass of Fuel [kg]                 %8.3f   \n', perf.mass_fuel);
+        fprintf('Mass of Oxidizer [kg]             %8.3f   \n', perf.mass_oxidizer);
+        fprintf('Exit Swirl [deg]                  %8.2f   \n', perf.mean_exit_swirl_angle);
+        fprintf('Range (Tsiolkovsky, Breguet) [Km] %8.2f   - %8.2f  \n', perf.range_tsiolkovsky, perf.range_breguet);
+        fprintf('\n');
+    
+    end
+end
+
+function plot_exit_velocity_profile(exit_props, flow_props, params)
+    % Plot exit plane inertial velocity profile (Figure 5 from paper)
+    
+    % Calculate theta_sle (theta of  onslip line on exit plane)
+    theta_sle = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sl));
+    theta_she = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sh));
+    % Calculate adjusted circumferential coordinate
+    theta_adjusted = (exit_props.theta - theta_sle) / pi;
+    
+    % Create the plot
+    figure('Name', 'Exit Plane Velocity', 'Position', [100, 100, 800, 600]);
+    
+    % Plot Vz (blue solid line)
+    plot(theta_adjusted, exit_props.Vz, '-', 'LineWidth', 2, 'DisplayName', 'V_z');
+    hold on;
+    
+    % Plot Vtheta (orange dash-dot line)
+    plot(theta_adjusted, exit_props.Vtheta, '-', 'LineWidth', 2, 'DisplayName', 'V_\theta');
+    
+    % Add vertical lines for key locations
+    xline((2*pi - theta_sle) / pi, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'DisplayName', '2\pi');
+    xline((theta_she + 2*pi - theta_sle) / pi, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'DisplayName', '\theta_{she}+2\pi');
+    
+    % Formatting
+    xlabel('Adjusted Circumferential Coordinate, (\theta - \theta_{sle})/\pi');
+    ylabel('Inertial Velocity, V (m/s)');
+    title('Exit plane inertial velocity profile of baseline design.');
+    
+    % Set axis limits similar to paper
+    xlim([0, 2]);
+    ylim([-1000, 2500]);
+    
+    % Add grid
+    grid on;
+    
+    % Add legend
+    legend('Location', 'best');
+    
+    % Add horizontal line at y=0
+    yline(0, '-', 'Color', [0.6 0.6 0.6], 'LineWidth', 1, 'DisplayName', '0');
+    
+    fprintf('Exit plane velocity profile plotted.\n');
+end
+
+function run_parametric_studies(baseline_params)
+    % Run parametric studies as described in the paper
+    
+    fprintf('Running Parametric Studies...\n');
+    fprintf('=============================\n');
+    
+    % Study 1: Pressure vs Temperature (Figure 6)
+    study_pressure_temperature(baseline_params);
+
+    % Study 2: Swirl angle vs Pressure (Figure 7)
+    study_swirl_pressure(baseline_params);
+
+    % Study 3: Annulus width vs Pressure (Figure 8)
+    study_width_pressure(baseline_params);
+
+    % Study 4: Annulus length vs Pressure (Figure 9)
+    study_length_pressure(baseline_params);
+
+    % Study 5: Equivalence ratio vs Pressure (Figure 10)
+    study_equivalence_pressure(baseline_params);
+
+    % Study 6: Length vs Width (Figure 11)
+    study_length_width(baseline_params);
+    
+    fprintf('All parametric studies completed.\n');
+end
+
+function study_pressure_temperature(baseline_params)
+    % Study 1: Pressure vs Temperature effects
+    
+    fprintf('Study 1: Pressure vs Temperature...\n');
+    
+    P_range = linspace(2, 20, 73) * 101325;  % 2-20 atm
+    T_range = [250, 275, 300, 350, 400];          % K
+    
+    results = run_parameter_sweep(baseline_params, P_range, T_range, ...
+                                  'P0_inj', 'T0_inj', 'Pressure (atm)', 'Temperature (K)');
+    
+    % Convert pressure to atm for plotting
+    plot_parametric_results(P_range/101325, results, T_range, ...
+                           'Injection Pressure (atm)', 'Temperature', 'K', 1);
+end
+
+function study_swirl_pressure(baseline_params)
+    % Study 2: Swirl angle vs Pressure effects
+    
+    fprintf('Study 2: Swirl angle vs Pressure...\n');
+    
+    psi_inj = linspace(-50, 50, 60) * pi/180;  % -50 to +50 degrees
+    P_range = [2, 5, 10, 15, 20] * 101325;         % atm
+    
+    results = run_parameter_sweep(baseline_params, psi_inj, P_range, ...
+                                  'psi_inj', 'P0_inj', 'Swirl Angle (deg)', 'Pressure (atm)');
+    
+    plot_parametric_results(psi_inj*180/pi, results, P_range/101325, ...
+                           'Injection Swirl Angle (deg)', 'Pressure', 'atm', 2);
+end
+
+function study_width_pressure(baseline_params)
+    % Study 3: Annulus width vs Pressure effects
+    
+    fprintf('Study 3: Annulus width vs Pressure...\n');
+    
+    width_range = linspace(0.001, 0.050, 60);      % 1-50 mm
+    P_range = [2, 5, 10, 15, 20] * 101325;         % atm
+    
+    results = run_parameter_sweep_geometry(baseline_params, width_range, P_range, ...
+                                          'width', 'P0_inj', 'Width (mm)', 'Pressure (atm)');
+    
+    plot_parametric_results(width_range*1000, results, P_range/101325, ...
+                           'Annulus Width (mm)', 'Pressure', 'atm', 3);
+end
+
+function study_length_pressure(baseline_params)
+    % Study 4: Annulus length vs Pressure effects
+    
+    fprintf('Study 4: Annulus length vs Pressure...\n');
+    
+    length_range = linspace(0.050, 0.300, 40);     % 50-300 mm
+    P_range = [2, 5, 10, 15, 20] * 101325;         % atm
+    
+    results = run_parameter_sweep(baseline_params, length_range, P_range, ...
+                                  'L', 'P0_inj', 'Length (mm)', 'Pressure (atm)');
+    
+    plot_parametric_results(length_range*1000, results, P_range/101325, ...
+                           'Annulus Length (mm)', 'Pressure', 'atm', 4);
+end
+
+function study_equivalence_pressure(baseline_params)
+    % Study 5: Equivalence ratio vs Pressure effects
+    
+    fprintf('Study 5: Equivalence ratio vs Pressure...\n');
+    
+    phi_range = linspace(0.75, 1.5, 60);           % 0.5-2.0
+    P_range = [2, 5, 10, 15, 20] * 101325;        % atm
+    
+    results = run_parameter_sweep(baseline_params, phi_range, P_range, ...
+                                  'phi', 'P0_inj', 'Equivalence Ratio', 'Pressure (atm)');
+    
+    plot_parametric_results(phi_range, results, P_range/101325, ...
+                           'Equivalence Ratio', 'Pressure', 'atm', 5);
+end
+
+function study_length_width(baseline_params)
+    % Study 6: Length vs Width effects
+    
+    fprintf('Study 6: Length vs Width...\n');
+    
+    length_range = linspace(0.050, 0.300, 50);    % 50-300 mm
+    width_range = [0.001, 0.005, 0.010, 0.025, 0.050];  % m
+    
+    results = run_parameter_sweep_geometry(baseline_params, length_range, width_range, ...
+                                          'L', 'width', 'Length (mm)', 'Width (mm)');
+
+    plot_parametric_results(length_range*1000, results, width_range*1000, ...
+                           'Annulus Length (mm)', 'Width', 'mm', 6);
+end
+
+function results = run_parameter_sweep(baseline_params, param1_range, param2_range, ...
+                                      param1_name, param2_name, param1_label, param2_label)
+    % Run parameter sweep for two parameters
+    
+    n1 = length(param1_range);
+    n2 = length(param2_range);
+    
+    % Initialize results arrays
+    results = struct();
+    results.mass_flow_inj = zeros(n1,n2);
+    results.mass_flow_exit = zeros(n1,n2);
+    results.mass_flow_error = zeros(n1,n2);
+    results.thrust = zeros(n1, n2);
+    results.torque = zeros(n1, n2);
+    results.Isp_z = zeros(n1, n2);
+    results.Isp_f = zeros(n1, n2);
+    results.rel_force_ratio = zeros(n1, n2);
+    results.swirl_angle = zeros(n1, n2);
+    
+    fprintf('Running %dx%d parameter sweep (%s vs %s)...\n', n1, n2, param1_label, param2_label);
+    
+    for j = 1:n2
+        for i = 1:n1
+            % Set parameters
+            params = baseline_params;
+            params.(param1_name) = param1_range(i);
+            params.(param2_name) = param2_range(j);
+            
+            try
+                % Calculate performance
+                result = calculate_rde_performance(params);
+
+                % if params.T0_inj == 400 
+                %     if params.P0_inj == (5*101325)
+                %          plot_exit_velocity_profile(result.exit, result.flow, result.params);
+                %          plot_exit_PT_profiles(result.exit, result.flow, result.detonation, result.params);
+                %          plot_exit_mach_profile(result.exit, result.flow, result.detonation, result.params);
+                %     end
+                % end
+
+                % Store results
+                results.mass_flow_inj(i,j) = result.performance.mass_flow_inj;
+                results.mass_flow_exit(i,j) = result.performance.mass_flow_exit;
+                results.mass_flow_error(i,j) = 100*(result.performance.mass_flow_inj-result.performance.mass_flow_exit )/result.performance.mass_flow_inj;
+                results.thrust(i,j) = result.performance.thrust;
+                results.torque(i,j) = result.performance.torque;
+                results.Isp_z(i,j) = result.performance.Isp_z;
+                results.Isp_f(i,j) = result.performance.Isp_f;
+                results.rel_force_ratio(i,j) = result.performance.relative_force_ratio;
+                results.swirl_angle(i,j) = result.performance.mean_exit_swirl_angle;
+
+            catch ME
+                fprintf('Failed at %s=%.3f, %s=%.3f: %s\n\n', ...
+                        param1_name, param1_range(i), param2_name, param2_range(j), ME.message);
+                warning('Internal flow calculation did not converge');
+            end
+        end
+        fprintf('Completed %d/%d parameter combinations\n', j*n1, n1*n2);
+    end
+end
+
+function results = run_parameter_sweep_geometry(baseline_params, param1_range, param2_range, ...
+                                               param1_name, param2_name, param1_label, param2_label)
+    % Run parameter sweep with geometry updates
+    
+    n1 = length(param1_range);
+    n2 = length(param2_range);
+    
+    % Initialize results arrays
+    results = struct();
+    results.thrust = zeros(n1, n2);
+    results.torque = zeros(n1, n2);
+    results.Isp_z = zeros(n1, n2);
+    results.Isp_f = zeros(n1, n2);
+    results.rel_force_ratio = zeros(n1, n2);
+    results.swirl_angle = zeros(n1, n2);
+    results.mass_flow_inj = zeros(n1, n2);
+    results.mass_flow_exit = zeros(n1, n2);
+    results.mass_flow_error = zeros(n1, n2);
+    
+    fprintf('Running %dx%d parameter sweep (%s vs %s)...\n', n1, n2, param1_label, param2_label);
+    
+    for j = 1:n2
+        for i = 1:n1
+            % Set parameters
+            params = baseline_params;
+            
+            if strcmp(param1_name, 'width')
+                params.delta_a = param1_range(i);
+                params.d_outer = params.d_inner + 2*param1_range(i);
+                params.r_mean = (params.d_outer + params.d_inner)/4;
+            else
+                params.(param1_name) = param1_range(i);
+            end
+            
+            if strcmp(param2_name, 'width')
+                params.delta_a = param2_range(j);
+                params.d_outer = params.d_inner + 2*param2_range(j);
+                params.r_mean = (params.d_outer + params.d_inner)/4;
+            else
+                params.(param2_name) = param2_range(j);
+            end
+            
+            try
+                % Calculate performance
+                result = calculate_rde_performance(params);
+                
+                % Store results
+                results.thrust(i,j) = result.performance.thrust;
+                results.torque(i,j) = result.performance.torque;
+                results.Isp_z(i,j) = result.performance.Isp_z;
+                results.Isp_f(i,j) = result.performance.Isp_f;
+                results.rel_force_ratio(i,j) = result.performance.relative_force_ratio;
+                results.swirl_angle(i,j) = result.performance.mean_exit_swirl_angle;
+                results.mass_flow_inj(i,j) = result.performance.mass_flow_inj;
+                results.mass_flow_exit(i,j) = result.performance.mass_flow_exit;
+                results.mass_flow_error(i,j) = 100*(result.performance.mass_flow_inj-result.performance.mass_flow_exit )/result.performance.mass_flow_inj;
+                
+            catch ME
+                fprintf('Failed at %s=%.3f, %s=%.3f: %s\n\n', ...
+                        param1_name, param1_range(i), param2_name, param2_range(j), ME.message);
+                warning('Internal flow calculation did not converge');
+            end
+        end
+        fprintf('Completed %d/%d parameter combinations\n', j*n1, n1*n2);
+    end
+end
+
+function plot_parametric_results(x_data, results, curve_params, x_label, curve_label, curve_units, study_num)
+    % Plot parametric study results (6 subplots as in the paper)
+    
+    colors = orderedcolors('gem');
+    
+    figure('Position', [100, 100, 900, 700]);
+    sgtitle(sprintf('Study %d: %s Effects (CEAM Implementation)', study_num, x_label), ...
+            'FontSize', 16, 'FontWeight', 'bold');
+    
+    % Plot 1: Thrust
+    subplot(2, 3, 1);
+    for j = 1:length(curve_params)
+        plot(x_data, results.thrust(:, j), 'Color',colors(j,:), 'LineStyle', '-', 'LineWidth', 2, ...
+             'DisplayName', sprintf('%s = %.1f %s', curve_label, curve_params(j), curve_units));
+        hold on;
+    end
+    xlabel(x_label);
+    ylabel('Thrust (N)');
+    xlim([min(x_data) max(x_data)]);
+    title('Thrust');
+    legend('Location', 'best');
+    grid on;
+    
+    % Plot 2: Torque
+    subplot(2, 3, 2);
+    for j = 1:length(curve_params)
+        plot(x_data, results.torque(:, j), 'Color', colors(j,:), 'LineStyle', '-', 'LineWidth', 2, ...
+             'DisplayName', sprintf('%s = %.1f %s', curve_label, curve_params(j), curve_units));
+        hold on;
+    end
+    xlabel(x_label);
+    ylabel('Torque (N·m)');
+    xlim([min(x_data) max(x_data)]);
+    title('Torque');
+    legend('Location', 'best');
+    grid on;
+    
+    % Plot 3: Relative force ratio
+    subplot(2, 3, 3);
+    for j = 1:length(curve_params)
+        plot(x_data, results.rel_force_ratio(:, j), 'Color', colors(j,:), 'LineStyle', '-', 'LineWidth', 2, ...
+             'DisplayName', sprintf('%s = %.1f %s', curve_label, curve_params(j), curve_units));
+        hold on;
+    end
+    xlabel(x_label);
+    ylabel('Relative z-θ Force Ratio');
+    xlim([min(x_data) max(x_data)]);
+    title('Relative Force Ratio');
+    legend('Location', 'best');
+    grid on;
+    
+    % Plot 4: Z-specific impulse
+    subplot(2, 3, 4);
+    for j = 1:length(curve_params)
+        plot(x_data, results.Isp_z(:, j), 'Color',colors(j,:), 'LineStyle', '-', 'LineWidth', 2, ...
+             'DisplayName', sprintf('%s = %.1f %s', curve_label, curve_params(j), curve_units));
+        hold on;
+    end
+    xlabel(x_label);
+    ylabel('Z-Specific Impulse (s)');
+    xlim([min(x_data) max(x_data)]);
+    title('Z-Specific Impulse');
+    legend('Location', 'best');
+    grid on;
+    
+    % Plot 5: Fuel-based specific impulse
+    subplot(2, 3, 5);
+    for j = 1:length(curve_params)
+        plot(x_data, results.Isp_f(:, j), 'Color',colors(j,:), 'LineStyle', '-', 'LineWidth', 2, ...
+             'DisplayName', sprintf('%s = %.1f %s', curve_label, curve_params(j), curve_units));
+        hold on;
+    end
+    xlabel(x_label);
+    ylabel('Fuel-Based Specific Impulse (s)');
+    xlim([min(x_data) max(x_data)]);
+    title('Fuel-Based Specific Impulse');
+    legend('Location', 'best');
+    grid on;
+    
+    % Plot 6: Mean exit swirl angle
+    subplot(2, 3, 6);
+    for j = 1:length(curve_params)
+        plot(x_data, results.swirl_angle(:, j), 'Color',colors(j,:), 'LineStyle', '-', 'LineWidth', 2, ...
+             'DisplayName', sprintf('%s = %.1f %s', curve_label, curve_params(j), curve_units));
+        hold on;
+    end
+    xlabel(x_label);
+    ylabel('Mean Exit Swirl Angle (deg)');
+    xlim([min(x_data) max(x_data)]);
+    title('Mean Exit Swirl Angle');
+    legend('Location', 'best');
+    grid on;
+
+    % Plot 7: mass flow at injection plane and mass flow on exit plane
+    figure('Position', [100, 100, 900, 700]);
+    sgtitle(sprintf('Study EXTRA %d: %s Effects (CEAM Implementation)', study_num, x_label), ...
+        'FontSize', 12, 'FontWeight', 'bold');
+    subplot(2,1,1);
+    for j = 1:length(curve_params)
+        plot(x_data, results.mass_flow_inj(:, j), 'Color',colors(j,:), 'LineStyle', '-.', 'LineWidth', 2, ...
+            'DisplayName', sprintf('%s = %.1f %s ($\\dot{m}_{injection}$)', curve_label, curve_params(j), curve_units));
+        hold on;
+        plot(x_data, results.mass_flow_exit(:, j), 'Color', colors(j,:), 'LineStyle', ':', 'LineWidth', 2, ...
+            'DisplayName', sprintf('%s = %.1f %s ($\\dot{m}_{exit}$)', curve_label, curve_params(j), curve_units));
+    end
+    xlabel(x_label);
+    ylabel('Mass Flow (kg/s)');
+    xlim([min(x_data) max(x_data)]);
+    title('Mass Flow');
+    legend('Location', 'best', 'Interpreter', 'latex');
+    grid on;
+
+    subplot(2,1,2);
+    for j = 1:length(curve_params)
+        plot(x_data, results.mass_flow_error(:,j), 'Color',colors(j,:), 'LineStyle', '-.', 'LineWidth', 2, ...
+            'DisplayName', sprintf('%s = %.1f %s', curve_label, curve_params(j), curve_units));
+        hold on;
+    end
+    xlabel(x_label);
+    ylabel('Mass Flow Percentage Error');
+    xlim([min(x_data) max(x_data)]);
+    title('Mass Flow Percentage Error');
+    legend('Location', 'best');
+    grid on;
+
+end
+
+function plot_exit_vpt_profiles(exit_props, flow_props, params)
+    % Abscissa normalization consistent with velocity plot
+    theta_sle = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sl));
+    theta_she = (params.L - flow_props.Lambda) / (params.r_mean * tan(flow_props.psi_sh));
+    x_norm    = (exit_props.theta - theta_sle) / pi;
+    
+    % Static exit profiles (already computed)
+    P2_vec = exit_props.P;     % [Pa]
+    T2_vec = exit_props.T;     % [K]
+    rho2_vec = exit_props.rho; % [kg/m^3]
+
+    M = exit_props.M_exit;
+    
+    % Use user-provided stagnation profiles (vectors)
+    P0_vec = exit_props.P0;    % total pressure vector
+    T0_vec = exit_props.T0;    % total temperature vector
+    rho0_vec = exit_props.rho0;% total density vector
+    
+    % Build figure with 3 tiles
+    f = figure('Name', 'Exit Plane Profiles (Pressure / Temperature / Density)','Position',[100, 100, 800, 700]);
+    t = tiledlayout(f, 4, 1);
+    t.TileSpacing = 'compact';
+    t.Padding = 'compact';
+    
+    % Subplot 1: P0 and P2
+    ax1 = nexttile(t);
+    plot(ax1, x_norm, P2_vec/1e6, 'b-', 'LineWidth', 2, 'DisplayName','P_2 (MPa)'); hold(ax1, 'on');
+    plot(ax1, x_norm, P0_vec/1e6, 'r--', 'LineWidth', 1.8, 'DisplayName','P_0 (MPa)');
+    [maxP, idxP] = max(P2_vec);
+    xp = x_norm(idxP);
+    yp = P2_vec(idxP)/1e6;
+    % Plot the circle marker for max point (hollow, not filling)
+    plot(ax1, xp, yp, 'o', 'MarkerSize', 8, 'MarkerEdgeColor', 'b', 'MarkerFaceColor', 'none', 'DisplayName', sprintf('Max = %.3f MPa', yp));
+    xline(ax1, (2*pi - theta_sle)/pi, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');
+    xline(ax1, (theta_she + 2*pi - theta_sle)/pi, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');
+    grid(ax1, 'on'); xlabel(ax1, '(\theta - \theta_{sle})/\pi'); ylabel(ax1, 'Pressure (MPa)');
+    xlim([0, 2]);
+    title(ax1, 'Exit plane: P_0 and P_2'); legend(ax1, 'Location','best');
+    
+    % Subplot 2: T0 and T2
+    ax2 = nexttile(t);
+    plot(ax2, x_norm, T2_vec, 'k-', 'LineWidth', 2, 'DisplayName','T_2 (K)'); hold(ax2, 'on');
+    plot(ax2, x_norm, T0_vec, 'm--', 'LineWidth', 1.8, 'DisplayName','T_0 (K)');
+    [maxT, idxT] = max(T2_vec);
+    xt = x_norm(idxT);
+    yt = T2_vec(idxT);
+    plot(ax2, xt, yt, 'o', 'MarkerSize', 8, 'MarkerEdgeColor', 'k', 'MarkerFaceColor', 'none', 'DisplayName', sprintf('Max = %.1f K', yt));
+    xline(ax2, (2*pi - theta_sle)/pi, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');
+    xline(ax2, (theta_she + 2*pi - theta_sle)/pi, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');
+    grid(ax2, 'on'); xlabel(ax2, '(\theta - \theta_{sle})/\pi'); ylabel(ax2, 'Temperature (K)');
+    xlim([0, 2]);
+    title(ax2, 'Exit plane: T_0 and T_2'); legend(ax2, 'Location','best');
+    
+    % Subplot 3: rho0 (totals)
+    ax3 = nexttile(t);
+    plot(ax3, x_norm, rho2_vec, 'g-', 'LineWidth', 2, 'DisplayName','\rho_2 (kg/m^3)'); hold(ax3, 'on');
+    plot(ax3, x_norm, rho0_vec, 'c--', 'LineWidth', 1.8, 'DisplayName','\rho_0 (kg/m^3)');
+    [maxRho, idxRho] = max(rho2_vec);
+    xr = x_norm(idxRho);
+    yr = rho2_vec(idxRho);
+    plot(ax3, xr, yr, 'o', 'MarkerSize', 8, 'MarkerEdgeColor', 'g', 'MarkerFaceColor', 'none', 'DisplayName', sprintf('Max = %.3f kg/m^3', yr));
+    xline(ax3, (2*pi - theta_sle)/pi, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');
+    xline(ax3, (theta_she + 2*pi - theta_sle)/pi, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');
+    grid(ax3, 'on'); xlabel(ax3, '(\theta - \theta_{sle})/\pi'); ylabel(ax3, '\rho (kg/m^3)');
+    xlim([0, 2]);
+    title(ax3, 'Exit plane: \rho_0 and \rho_2'); legend(ax3, 'Location','best');
+
+    % Subplot 4: Mach
+    ax4 = nexttile(t);
+    plot(ax4, x_norm, M, 'r-', 'LineWidth', 2, 'DisplayName','Mach'); hold(ax4, 'on');
+    [maxM, idxM] = max(M);
+    xM = x_norm(idxM);
+    yM = M(idxM);
+    plot(ax4, xM, yM, 'o', 'MarkerSize', 8, 'MarkerEdgeColor', 'g', 'MarkerFaceColor', 'none', 'DisplayName', sprintf('Max = %.3f', yM));
+    xline(ax4, (2*pi - theta_sle)/pi, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');   % 2π
+    xline(ax4, (theta_she + 2*pi - theta_sle)/pi, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1, 'HandleVisibility','off');
+    grid(ax4, 'on');
+    xlabel('(\theta - \theta_{sle})/\pi'); ylabel('Mach number, M');
+    xlim([0, 2]);
+    title(ax4, 'Exit plane Mach number profile');
+
+    fprintf('Exit plane P/T/rho/M plotted.\n');
+
+end
+
+
+function plot_inlet_vpt_profile(performance, ~, ~, ~)
+    % Plot inlet plane axial velocity, static pressure, and temperature
+    
+    % Define theta range for injection plane
+    x = linspace(0, 2*pi, numel(performance.Vz_inj));  % match array length
+    
+    % Extract inlet profiles from performance struct
+    Vz_inj = performance.Vz_inj;   % Inlet axial velocity [m/s]
+    P_inj  = performance.P_inj;    % Inlet static pressure [Pa]
+    T_inj  = performance.T_inj;    % Inlet static temperature [K]
+    rho_inj  = performance.rho_inj;% Inlet static density [Kg/m3]
+    
+    % Create one figure with 3 subplots (3 rows, 1 column)
+    figure('Name', 'Inlet Plane Profiles (Pressure / Temperature / Density / Velocity)','Position',[100 100 800 700]);                
+    
+    % --- Subplot 1: Injection Static Pressure ---
+    subplot(4,1,1);  % row 1 of 4
+    plot(x, P_inj, 'b-', 'LineWidth', 2);  
+    grid on;
+    xlim([0, 2*pi]);
+    xlabel('Circumferential coordinate \theta (rad)');  
+    ylabel('Static Pressure (Pa)');                    
+    title('Inlet Plane Static Pressure');             
+    legend('P','Location','best');                 
+    
+    % --- Subplot 2: Injection Static Temperature ---
+    subplot(4,1,2);  % row 2 of 4
+    plot(x, T_inj, 'k-', 'LineWidth', 2);
+    grid on;
+    xlim([0, 2*pi]);  
+    xlabel('Circumferential coordinate \theta (rad)');  
+    ylabel('Static Temperature (K)');                   
+    title('Inlet Plane Static Temperature');          
+    legend('T','Location','best'); 
+
+    % --- Subplot 3: Injection Static Temperature ---
+    subplot(4,1,3);  % row 3 of 4
+    plot(x, rho_inj, 'g-', 'LineWidth', 2);
+    grid on;
+    xlim([0, 2*pi]);  
+    xlabel('Circumferential coordinate \theta (rad)');  
+    ylabel('Static Density \rho (kg/m^3)');                   
+    title('Inlet Plane Static Density');          
+    legend('\rho','Location','best'); 
+
+    % --- Subplot 4: Injection Axial Velocity ---
+    subplot(4,1,4);  % row 4 of 4
+    plot(x, Vz_inj, 'r-', 'LineWidth', 2);  
+    grid on;
+    xlim([0, 2*pi]);
+    xlabel('Circumferential coordinate \theta (rad)');  
+    ylabel('Axial Velocity V_z (m/s)');                 
+    title('Inlet Plane Axial Velocity');                
+    legend('V_z','Location','best');    
+    
+    fprintf('Inlet plane axial pressure, temperature, density and velocity plotted\n');  
+end
+
+function [cea_output, P_cr, T_cr] = htpb_calculation(params)
+        % Step 1: Run constant-pressure deflagration at low conditions
+        % Run CEAM for constant-pressure combustion (hp problem) 
+        cea_deflag = CEA('prob', 'hp', ...
+                         'phi,eq.ratio', params.phi_deflag, ...
+                         'p,atm', params.P_deflag/101325, ...
+                         'reac', ...
+                         'fuel', params.fuel, params.fuel_composition{:}, 'wtfrac', params.wtfrac_htpb, 't,k', params.T_deflag, 'h,kj/mol', 23.99,'rho,g/cc',0.930,...
+                         'fuel', 'Al', 'wtfrac', params.wtfrac_al, 't,k', params.T_deflag, 'h,kj/mol', 0.0, 'rho,g/cc', 2.70, ...
+                         'oxid', 'NH4ClO4(I)', 'wtfrac', params.wtfrac_ap, 't,k', params.T_deflag, ...
+                         'oxid', params.oxidizer, 'wtfrac', 1, 't,k', params.T0_inj_ox, ...
+                         'output', 'end');
+        
+        
+       % Extract deflagration products
+        deflag_output = cea_deflag.output;
+        T_deflag_out = deflag_output.temperature;
+        P_deflag_out = deflag_output.pressure * 101325;  % Convert to Pa
+        
+        fprintf('Deflagration products: T = %.2f K, P = %.2f atm\n', ...
+                T_deflag_out, P_deflag_out/101325);
+        
+        % The 'products' field contains species names as a cell array
+        species_list = deflag_output.products;  % Cell array of species names
+        n_species = length(species_list);
+        
+        % Get mass/mole fractions array
+        fractions_array = deflag_output.fractions;  % This is a double array
+        
+        fprintf('\n=== Processing Deflagration Products ===\n');
+        fprintf('Total species from deflagration: %d\n\n', n_species);
+        
+        % Define comprehensive fuel and oxidizer species lists
+        % FUELS - Only gas-phase species at 1000K
+        % FUELS - Only gas-phase species at 1000K
+        fuel_species = {...
+                        'H2', 'H', 'CO', ...
+                        'CH', 'CH2', 'CH3', 'CH4', ...
+                        'C2H', 'C2H2,acetylene', 'C2H3', 'C2H3,vinyl', 'C2H4', 'C2H5', 'C2H6', ...
+                        'C3H3', 'C3H3,2-propynl', 'C3H4,allene', 'C3H4,propyne', 'C3H4,cyclo-', ...
+                        'C3H5', 'C3H5,allyl', 'C3H6', 'C3H6,propylene', 'C3H6,cyclo-', 'C3H7', ...
+                        'C3H7,n-propyl', 'C3H7,i-propyl', 'C3H8', ...
+                        'C4H2', 'C4H2,butadiyne', 'C4H4', 'C4H6', 'C4H6,butadiene', 'C4H6,1butyne', ...
+                        'C4H6,2butyne', 'C4H6,cyclo-', 'C4H8', 'C4H8,1-butene', 'C4H8,cis2-buten', ...
+                        'C4H8,tr2-butene', 'C4H8,isobutene', 'C4H9', 'C4H9,n-butyl', 'C4H9,i-butyl', ...
+                        'C4H9,s-butyl', 'C4H9,t-butyl', 'C4H10', 'C4H10,n-butane', 'C4H10,isobutane', ...
+                        'C5H6', 'C5H6,1,3cyclo-', 'C5H8', 'C5H8,cyclo-', 'C5H10', 'C5H10,1-pentene', ...
+                        'C5H11', 'C5H11,pentyl', 'C5H12', 'C5H12,n-pentane', 'C5H12,i-pentane', ...
+                        'CH3C(CH3)2CH3', ...
+                        'C6H2', 'C6H5', 'C6H6', 'C6H12', 'C6H12,1-hexene', 'C6H13', 'C6H14', 'C6H14,n-hexane', ...
+                        'C7H7', 'C7H7,benzyl', 'C7H8', 'C7H14', 'C7H14,1-heptene', 'C7H15', 'C7H16', ...
+                        'C7H16,n-heptane', 'C7H16,2-methylh', ...
+                        'C8H8', 'C8H8,styrene', 'C8H10,ethylbenz', 'C8H16', 'C8H17', 'C8H18', ...
+                        'C10H21', 'C12H9', 'C12H10', ...
+                        'NH', 'NH2', 'NH3', 'N2H2', 'N2H4', ...
+                        'HCN', 'HNC', 'HNCO', 'CN', 'C2N2', ...
+                        'H2S', 'HS', 'CS', 'CS2', 'COS', ...
+                        'BH', 'BH2', 'BH3', 'B2H6', 'B5H9', ...
+                        'HCO'};
+
+
+        % OXIDIZERS - Oxidizing agents and inert species
+        % OXIDIZERS - Only gas-phase species at 1000K
+        oxid_species = {...
+                        'O', 'O2', 'O3', 'OH', 'H2O', 'H2O2', 'HO2', ...
+                        'CO2', 'COOH', ...
+                        'NO', 'NO2', 'NO3', 'N2O', 'N2O3', 'N2O4', 'N2O5', ...
+                        'N2', 'He', 'Ne', 'Kr', 'Xe', 'Air', ...                  % Inert gases (Ar excluded)
+                        'CL', 'CL2', 'CLO', 'CLO2', 'HCL', 'HOCL', 'CLCN', ...
+                        'F', 'F2', 'HF', 'OF', 'OF2', ...
+                        'BR', 'BR2', 'HBR', ...
+                        'I', 'I2', 'HI', ...
+                        'SO', 'SO2', 'SO3', 'HSO3', ...
+                        'N', 'N3', ...
+                        'CH2CL', 'CH3CL', 'CH2OH', 'CH3OH', 'COHCL', ...
+                        'CH2CO,ketene', 'C2HCL', 'C2H3CL', 'CH3CN', 'CH3CO,acetyl', ...
+                        'CH3CHO,ethanal', 'CH3COOH', 'C2H5OH', ...
+                        'C3O2', 'C3H6O,acetone', 'C3H6O,propanal', ...
+                        'C3H8O,1propanol', 'C3H8O,2propanol', ...
+                        'C6H5OH,phenol', ...
+                        'HCHO,formaldehy', 'HCOOH', ...
+                        'Jet-A(g)'};
+
+        % Species that are SOLID or LIQUID at 1000K (727°C)
+        condensed_at_1000K = {...
+                              'C', 'C2', 'C3', 'C4', 'C5', ...                          % Solid carbon clusters
+                              'B', 'B2', ...                                            % Solid boron
+                              'AL', 'AL2', 'ALO', 'ALO2', 'AL2O', 'AL2C2' ...                          % Aluminum (liquid) and oxides (solid)
+                              'ALOH', 'ALOH2', 'ALOH3', 'AL(OH)3', 'ALHCL', 'AL(OH)2CL', ...     % Aluminum hydroxides (solid)
+                              'ALN', ...                                                % Aluminum nitride (solid)
+                              'ALCL', 'ALOCL', 'ALCL2', 'ALCL3', ...                    % Aluminum chlorides (solid/liquid)
+                              'ALF', 'ALF2', 'ALF3', ...                                % Aluminum fluorides (solid)
+                              'ALOHCL', 'ALOHCL2', 'ALOHF', 'ALOHF2', 'ALHCL2', ...     % Aluminum oxy-halides (solid)
+                              'ALH', 'ALH2', 'ALH3', ...                                % Aluminum hydrides (solid)
+                              'Ar'};                                                    % Argon (excluded - inert gas)
+
+
+        
+        % Arrays to store gas-phase species
+        fuel_names = {};
+        fuel_fracs = [];
+        oxid_names = {};
+        oxid_fracs = [];
+        
+        fprintf('%-20s %15s %15s\n', 'Species', 'Mass Frac', 'Classification');
+        fprintf('%-20s %15s %15s\n', '-------', '---------', '--------------');
+        
+        % Process each species from deflagration
+        for i = 1:n_species
+            species_name = species_list{i};
+            mass_frac = fractions_array(i);
+                        
+            % Remove asterisks from CEA output format (*H2 -> H2)
+            species_name = strrep(species_name, '*', '');
+            
+            % Check if condensed species (exclude from detonation)
+            is_condensed = contains(species_name, '(L)') || ...
+                           contains(species_name, '(l)') || ...
+                           contains(species_name, '(cr)') || ...
+                           contains(species_name, '(a)') || ...
+                           contains(species_name, '(b)') || ...
+                           contains(species_name, '(c)') || ...
+                           contains(species_name, 'gr)') || ...
+                           any(strcmp(species_name, condensed_at_1000K));
+            
+            if is_condensed
+                fprintf('%-20s %15.6e %15s\n', species_name, mass_frac, 'EXCLUDED (solid/liquid)');
+                continue;
+            end
+            
+            
+            % Classify as fuel or oxidizer
+            is_fuel = any(strcmp(species_name, fuel_species));
+            is_oxid = any(strcmp(species_name, oxid_species));
+            
+            if is_fuel
+                fuel_names{end+1} = species_name;
+                fuel_fracs(end+1) = mass_frac;
+                fprintf('%-20s %15.6e %15s\n', species_name, mass_frac, 'FUEL');
+            elseif is_oxid
+                oxid_names{end+1} = species_name;
+                oxid_fracs(end+1) = mass_frac;
+                fprintf('%-20s %15.6e %15s\n', species_name, mass_frac, 'OXID/INERT');
+            else
+                % Unknown species - default to oxidizer/inert to be safe
+                oxid_names{end+1} = species_name;
+                oxid_fracs(end+1) = mass_frac;
+                fprintf('%-20s %15.6e %15s\n', species_name, mass_frac, 'UNKNOWN->OXID');
+            end
+        end
+        
+        % Calculate totals and renormalize
+        n_fuel = length(fuel_names);
+        n_oxid = length(oxid_names);
+        total_fuel_mass = sum(fuel_fracs);
+        total_oxid_mass = sum(oxid_fracs);
+        total_gas_mass = total_fuel_mass + total_oxid_mass;
+        
+        fprintf('\n=== Gas-Phase Species Summary ===\n');
+        fprintf('Number of fuel species:     %d\n', n_fuel);
+        fprintf('Number of oxidizer species: %d\n', n_oxid);
+        fprintf('Total fuel mass fraction:   %.6f (%.2f%%)\n', total_fuel_mass, total_fuel_mass*100);
+        fprintf('Total oxid mass fraction:   %.6f (%.2f%%)\n', total_oxid_mass, total_oxid_mass*100);
+        fprintf('Total gas mass fraction:    %.6f (%.2f%%)\n', total_gas_mass, total_gas_mass*100);
+        
+        % Check if we have fuel species
+        if n_fuel == 0
+            error('No fuel species found in gasified mixture! Cannot proceed with detonation.');
+        end
+        
+        % Renormalize to 100% (in case condensed species were excluded)
+        fuel_fracs_norm = fuel_fracs / total_gas_mass;
+        oxid_fracs_norm = oxid_fracs / total_gas_mass;
+        
+        % Build CEA reactant strings with weight percentages
+        fuel_string = {};
+        oxid_string = {};
+        
+        fprintf('\n=== Building CEA Reactant Strings ===\n');
+        fprintf('\nFUEL components:\n');
+        for i = 1:n_fuel
+            fuel_string{end+1} = 'fuel';
+            fuel_string{end+1} = fuel_names{i};
+            fuel_string{end+1} = 'wt%';
+            fuel_string{end+1} = fuel_fracs_norm(i) * 100;  % Convert to percentage
+            fprintf('  %-20s: %.6f wt%%\n', fuel_names{i}, fuel_fracs_norm(i)*100);
+        end
+        
+        fprintf('\nOXIDIZER components:\n');
+        for i = 1:n_oxid
+            oxid_string{end+1} = 'oxid';
+            oxid_string{end+1} = oxid_names{i};
+            oxid_string{end+1} = 'wt%';
+            oxid_string{end+1} = oxid_fracs_norm(i) * 100;  % Convert to percentage
+            fprintf('  %-20s: %.6f wt%%\n', oxid_names{i}, oxid_fracs_norm(i)*100);
+        end
+        
+        % Calculate O/F ratio
+        total_fuel_norm = sum(fuel_fracs_norm);
+        total_oxid_norm = sum(oxid_fracs_norm);
+        of_ratio = total_oxid_norm / total_fuel_norm;
+        
+        fprintf('\n=== Final Mixture Composition ===\n');
+        fprintf('Total fuel (normalized):     %.6f (%.2f%%)\n', total_fuel_norm, total_fuel_norm*100);
+        fprintf('Total oxidizer (normalized): %.6f (%.2f%%)\n', total_oxid_norm, total_oxid_norm*100);
+        fprintf('O/F ratio:                   %.6f\n', of_ratio);
+        fprintf('Equivalence ratio (approx):  %.6f\n\n', 1/of_ratio);
+        
+        
+        % Use injection conditions for detonation (choked flow)
+        gamma_inj = deflag_output.gamma;
+        params.P0_inj = P_deflag_out;
+        params.T0_inj = T_deflag_out;
+        % Assuming choked injection
+        P_cr = params.P0_inj * (2/(gamma_inj + 1))^(gamma_inj/(gamma_inj-1));
+        T_cr = params.T0_inj * (P_cr/params.P0_inj)^((gamma_inj-1)/gamma_inj);
+        
+        err = Inf;
+
+        while err > 1e-4
+
+            gamma_old = gamma_inj;
+            
+            % Run CEAM detonation with deflagration products as reactants
+            try
+            cea_output = CEA('prob', 'det', ...
+                             'phi,eq.ratio', params.phi, ...
+                             't,k', T_cr, ...
+                             'p,atm', P_cr/101325, ...
+                             'reac', ...
+                             fuel_string{:}, 't,k', T_cr, oxid_string{:}, 't,k', T_cr, ...
+                             'oxid', params.oxidizer, 'wtfrac',1, 't,k', params.T0_inj_ox, ...
+                             'output', 'end');
+            catch ME
+                fprintf('%s\n', ME.message);
+            end
+
+            gamma_inj = cea_output.output.unburned.gamma;
+            
+            err = abs(gamma_old - gamma_inj);
+            
+            P_cr = params.P0_inj * (2/(gamma_inj + 1))^(gamma_inj/(gamma_inj-1));
+            T_cr = params.T0_inj * (P_cr/params.P0_inj)^((gamma_inj-1)/gamma_inj);
+        end
+
+end
+
+function plot_thrust_over_time(performance, params)
+    % Plot thrust variation over the engine operating time
+    % Generates a time-series plot showing constant thrust output
+    
+    % Time vector from 0 to operating time
+    time = linspace(0, params.time, 1000);  % 1000 points for smooth line
+    
+    % Constant thrust over time (steady-state RDE operation)
+    thrust = performance.thrust * ones(size(time));
+    
+    % Create figure
+    figure('Name', 'Thrust over Time','Position', [100, 100, 800, 600]);
+    
+    % Plot thrust vs time
+    plot(time, thrust, 'b-', 'LineWidth', 2.5);
+    hold on;
+    
+    % Add grid
+    grid on;
+    
+    % Labels
+    xlabel('Time (s)', 'FontSize', 12);
+    ylabel('Thrust (N)', 'FontSize', 12);
+    
+    % Title with better formatted data
+    title({sprintf('Thrust = %.1f N   |   Total Impulse = %.1f N·s   |   I_{sp,z} = %.1f s', ...
+           performance.thrust, performance.I_tot, performance.Isp_z), ...
+           'Thrust vs Time'}, ...
+           'FontSize', 12, 'FontWeight', 'bold');
+    
+    % Set axis limits
+    xlim([0, params.time]);
+    ylim([0, performance.thrust * 1.2]);  % 20% margin above thrust value
+    
+    hold off;
+end
+
+function aerospike_geom = run_aerospike_implementation(baseline_results)
+    % AEROSPIKE NOZZLE DESIGN WITH CONVERGENCE
+    % Convergence: Adjust h (throat height) until inlet diameter matches d_inner
+    
+    M_chamber_exit = mean(baseline_results.exit.M_exit) * cos(baseline_results.performance.mean_exit_swirl_angle*pi/180);
+    d_inner = baseline_results.params.d_inner;
+    d_outer = baseline_results.params.d_outer;
+    delta_a = baseline_results.params.delta_a;
+    h_initial = delta_a;  % Initial guess for throat height [m]
+    gamma = baseline_results.detonation.gamma2;
+    p_tot_chamber_exit = mean(baseline_results.exit.P0);
+    p_static_nozzle_exit = baseline_results.params.P_back;
+    
+    L_chamber = baseline_results.params.L;
+
+    % NPR is from chamber conditions
+    NPR = p_tot_chamber_exit / p_static_nozzle_exit;
+    M_e = sqrt((2)/(gamma-1)*(NPR^((gamma-1)/(gamma))-1));
+
+
+    % Calculate nozzle inlet Mach from area ratio with current h
+    A_chamber = pi*((d_outer/2)^2 - (d_inner/2)^2);  % Chamber annular area
+   
+    % Get area ratio at chamber exit Mach
+    AR_chamber = Mach2AR(M_chamber_exit, gamma);
+    A_star = A_chamber / AR_chamber;
+
+    cut_d_out_percent = 3/100;
+    % fprintf('\n========== AEROSPIKE CONVERGENCE ITERATION ==========\n');
+    % fprintf('Target inner diameter: d_inner = %.4f m (%.2f mm)\n', d_inner, d_inner*1000);
+    % fprintf('Outer diameter:        d_outer = %.4f m (%.2f mm)\n', d_outer, d_outer*1000);
+    % fprintf('Chamber thickness:     delta_a = %.4f m (%.2f mm)\n', delta_a, delta_a*1000);
+    % fprintf('Chamber exit Mach:     M_chamber = %.4f\n', M_chamber_exit);
+    % fprintf('FIXED NPR:             NPR = %.4f\n', NPR);
+    % fprintf('FIXED Exit Mach:       M_e = %.4f\n', M_e);
+    % fprintf('\n*** Convergence variable: h (throat height) ***\n');
+    % fprintf('=====================================================\n\n');
+    
+    % Convergence parameters
+    tolerance = 1e-6;  % Convergence tolerance for diameter [m]
+    max_iterations = 50;
+    h = h_initial;  % Start with initial guess
+    
+    converged = false;
+    iteration = 0;
+    
+    % Store results
+    d_inlet_history = [];
+    h_history = [];
+    M_inlet_history = [];
+    
+    while ~converged && iteration < max_iterations
+        iteration = iteration + 1;
+        
+        A_nozzle_inlet = pi*( ((d_inner/2) + h)^2 - (d_inner/2)^2 );  % Nozzle inlet area with current h
+        
+
+        AR_inlet = A_nozzle_inlet / A_star;
+        
+        % Find Mach at nozzle inlet
+        M_nozzle_inlet = AR2Mach(AR_inlet, gamma);
+        
+        % Generate aerospike contour with current h
+        N = 30;  % Number of characteristic points
+        M_i = M_nozzle_inlet;  % Throat
+        while M_e < M_i        % If h is so big to speed up the flow too much
+            h = h - 0.001;
+            A_nozzle_inlet = pi*( ((d_inner/2) + h)^2 - (d_inner/2)^2 );
+            AR_inlet = A_nozzle_inlet / A_star;
+            M_nozzle_inlet = AR2Mach(AR_inlet, gamma);
+            M_i = M_nozzle_inlet;
+        end
+        M = linspace(M_i, M_e, N);
+        
+        % Mach angle
+        mu = asin(1./M);
+        
+        % Prandtl-Meyer angle
+        theta = sqrt((gamma + 1) / (gamma - 1)) .* atan(sqrt((gamma - 1) / (gamma + 1) * (M.^2 - 1))) - atan(sqrt(M.^2 - 1));
+        theta_i = sqrt((gamma+1)/(gamma-1)) * atan(sqrt((gamma-1)/(gamma+1)*(M_i^2-1))) - atan(sqrt(M_i^2-1));
+        theta = theta - theta_i;
+        % Calculate characteristic length with current h
+        l = M(1)* h * ((1+(gamma-1)/2*M.^2)/(1+(gamma-1)/2*M(1).^2)).^((gamma+1)/(2*(gamma-1)));
+        
+        % Flow turn angle
+        beta = mu - theta;
+
+        % Local coordinates
+        x = l.*cos(beta);
+        y = l.*sin(beta);
+    
+        % Define throat walls
+        L_wall = 2*h;
+        x_wall = [-L_wall, 0, 0, -L_wall, -L_wall];
+        y_wall = [0, 0, h, h, 0];
+        
+        % PREPEND the bottom-left wall point to spike geometry
+        % Bottom point is at x_wall(1) = -L_wall, y_wall(1) = 0
+        
+        x = [x_wall(3); x(:)];  % Add wall bottom as first point
+        y = [y_wall(3); y(:)];  % Add wall bottom as first point
+    
+        L = x(end) - x(1);
+        
+        % Translation
+        x_p = x - x(end);
+        y_p = y - y(end);
+        yt_p = 0 - y(end);
+        xt_p = 0 - x(end);
+        x_wall_p = x_wall - x(end);
+        y_wall_p = y_wall - y(end);
+        
+        % Rotation
+        theta_end = theta(end);
+        x_s = x_p * cos(theta_end) - y_p * sin(theta_end);
+        y_s = x_p * sin(theta_end) + y_p * cos(theta_end);
+        xt_s = xt_p * cos(theta_end) - yt_p * sin(theta_end);
+        yt_s = xt_p * sin(theta_end) + yt_p * cos(theta_end);
+        x_wall_s = x_wall_p * cos(theta_end) - y_wall_p * sin(theta_end);
+        y_wall_s = x_wall_p * sin(theta_end) + y_wall_p * cos(theta_end);
+        
+        % Translation
+        x_s = x_s - x_wall_s(3);
+        xt_s = xt_s - x_wall_s(3);
+        x_wall_s = x_wall_s - x_wall_s(3);
+        
+        L_n = abs(max(x_s) - min(x_s));
+
+        % % FIGURE for plot rotation while iterating
+        % figure('Name', 'Rotation', 'Position', [150, 150, 800, 600]);
+        % plot(x_s/L_n, y_s, '-r', 'LineWidth', 1.5);
+        % hold on;
+        % for i = 1:length(x)
+        %     plot([xt_s(1)/L_n, x_s(i)/L_n], [yt_s(1), y_s(i)], '-k', 'LineWidth', 0.75);
+        % end
+        % plot(x_wall_s/L_n, y_wall_s, 'b-', 'LineWidth', 1.5);
+        % grid on;
+        % xlabel('X''''/L', 'FontSize', 12);
+        % ylabel('Y'''' [m]', 'FontSize', 12);
+        % title('Rotazione', 'FontSize', 14, 'FontWeight', 'bold');
+
+        % Calculate inlet diameter (distance between upper and lower contour at beginning)
+        d_inlet_calculated = 2 * abs(y_s(1));  % Diameter at inlet
+        
+        % Store history
+        d_inlet_history(iteration) = d_inlet_calculated;
+        h_history(iteration) = h;
+        M_inlet_history(iteration) = M_nozzle_inlet;
+        
+        % Check convergence
+        error = abs(d_inlet_calculated - d_inner);
+        
+        fprintf('Iteration %d: h = %.6f m (%.3f mm), M_inlet = %.4f, d_inlet = %.6f m (%.3f mm), Error = %.6f m\n', ...
+                iteration, h, h*1000, M_nozzle_inlet, d_inlet_calculated, d_inlet_calculated*1000, error);
+        
+        if error < tolerance
+            converged = true;
+            % fprintf('\n*** CONVERGENCE ACHIEVED ***\n');
+            % fprintf('Final h = %.6f m (%.3f mm)\n', h, h*1000);
+            % fprintf('Final M_inlet = %.4f\n', M_nozzle_inlet);
+            % fprintf('Final d_inlet = %.6f m (%.3f mm)\n', d_inlet_calculated, d_inlet_calculated*1000);
+        else
+            % Update h using secant method or simple adjustment
+            if iteration == 1
+                % First iteration: increase or decrease h based on error
+                if d_inlet_calculated < d_inner
+                    % Need larger inlet diameter -> increase h
+                    h = h * 0.95;
+                else
+                    % Need smaller inlet diameter -> decrease h
+                    h = h * 1.05;
+                end
+            else
+                % Secant method for subsequent iterations
+                if iteration >= 2
+                    % Use last two points for secant method
+                    d1 = d_inlet_history(iteration-1);
+                    d2 = d_inlet_history(iteration);
+                    h1 = h_history(iteration-1);
+                    h2 = h_history(iteration);
+                    
+                    % Secant update
+                    if abs(d2 - d1) > 1e-10
+                        h_new = h2 - (d2 - d_inner) * (h2 - h1) / (d2 - d1);
+                        % Limit h change to avoid instability and keep physical bounds
+                        h_new = max((sqrt((A_star/pi)+(d_inner/2)^2)-(d_inner/2)), min(d_inner*2, h_new));  % h between minimum sonic h (3.859mm) and 100 mm
+                        h = h_new;
+                    else
+                        fprintf('Convergence not achieved after %d iterations: h = %.6f m (%.3f mm), M_inlet = %.4f, d_inlet = %.6f m (%.3f mm), Error = %.6f m\n', ...
+                        iteration, h, h*1000, M_nozzle_inlet, d_inlet_calculated, d_inlet_calculated*1000, error);
+                        
+                        if d_inlet_calculated < d_inner     % Aerospike is too small
+                            h = h_initial;  % Use condition without section reduction
+                            A_nozzle_inlet = pi*( ((d_inner/2) + h)^2 - (d_inner/2)^2 );
+                            AR_inlet = A_nozzle_inlet / A_star;
+                            M_nozzle_inlet = M_chamber_exit;
+                            M_i = M_nozzle_inlet;
+                            while M_e < M_i        % If h is so big to speed up the flow too much
+                                h = h - 0.001;
+                                A_nozzle_inlet = pi*( ((d_inner/2) + h)^2 - (d_inner/2)^2 );
+                                AR_inlet = A_nozzle_inlet / A_star;
+                                M_nozzle_inlet = AR2Mach(AR_inlet, gamma);
+                                M_i = M_nozzle_inlet;
+                            end
+                            M = linspace(M_i, M_e, N);
+                            mu = asin(1./M);
+                            theta = sqrt((gamma + 1) / (gamma - 1)) .* atan(sqrt((gamma - 1) / (gamma + 1) * (M.^2 - 1))) - atan(sqrt(M.^2 - 1));
+                            theta_i = sqrt((gamma+1)/(gamma-1)) * atan(sqrt((gamma-1)/(gamma+1)*(M_i^2-1))) - atan(sqrt(M_i^2-1));
+                            theta = theta - theta_i;
+                            l = M(1)* h * ((1+(gamma-1)/2*M.^2)/(1+(gamma-1)/2*M(1).^2)).^((gamma+1)/(2*(gamma-1)));
+                            beta = mu - theta;
+                    
+                            % Local coordinates
+                            x = l.*cos(beta);
+                            y = l.*sin(beta);
+                        
+                            % Define throat walls
+                            L_wall = 2*h;
+                            x_wall = [-L_wall, 0, 0, -L_wall, -L_wall];
+                            y_wall = [0, 0, h, h, 0];
+                            
+                            % PREPEND the bottom-left wall point to spike geometry
+                            % Bottom point is at x_wall(1) = -L_wall, y_wall(1) = 0
+                            x = [x_wall(3); x(:)];  % Add wall bottom as first point
+                            y = [y_wall(3); y(:)];  % Add wall bottom as first point
+                            L = x(end) - x(1);
+                            
+                            % Translation
+                            x_p = x - x(end);
+                            y_p = y - y(end);
+                            yt_p = 0 - y(end);
+                            xt_p = 0 - x(end);
+                            x_wall_p = x_wall - x(end);
+                            y_wall_p = y_wall - y(end);
+                            
+                            % Rotation
+                            theta_end = theta(end);
+                            x_s = x_p * cos(theta_end) - y_p * sin(theta_end);
+                            y_s = x_p * sin(theta_end) + y_p * cos(theta_end);
+                            xt_s = xt_p * cos(theta_end) - yt_p * sin(theta_end);
+                            yt_s = xt_p * sin(theta_end) + yt_p * cos(theta_end);
+                            x_wall_s = x_wall_p * cos(theta_end) - y_wall_p * sin(theta_end);
+                            y_wall_s = x_wall_p * sin(theta_end) + y_wall_p * cos(theta_end);
+                            
+                            % Translation
+                            x_s = x_s - x_wall_s(3);
+                            xt_s = xt_s - x_wall_s(3);
+                            x_wall_s = x_wall_s - x_wall_s(3);
+                            L_n = abs(max(x_s) - min(x_s));
+                            
+                            d_inlet_calculated = 2 * abs(y_s(1));
+                            d_filling = d_inner - d_inlet_calculated;
+                            
+                            % Translation
+                            yt_s = yt_s - d_filling/2;
+                            y_s = y_s - d_filling/2;
+                            y_wall_s = y_wall_s - d_filling/2;
+
+                            % EXTERNAL COWL GEOMETRY FOR ANNULAR AEROSPIKE
+                            % Point 1: Top of throat wall (horizontal exit)
+                            x1 = -cut_d_out_percent * L_chamber;
+                            y1 = -d_outer/2;
+                            dy1 = 0;  % Horizontal exit
+                            
+                            % Point 2: Match expansion slope
+                            x2 = x_wall_s(2);
+                            y2 = y_wall_s(2);
+                            dy2 = (y_s(2) - y_s(1)) / (x_s(2) - x_s(1));
+                            
+                            % Create spline with clamped derivatives
+                            x_ctrl = [x1, x2];
+                            y_ctrl = [y1, y2];
+                            n_spline = 50;
+                            
+                            x_cowl_connect = linspace(x1, x2, n_spline);
+                            
+                            % Use csape with 'clamped' - this is the proper way
+                            pp = csape(x_ctrl, y_ctrl, 'clamped', [dy1, dy2]);
+                            y_cowl_connect = ppval(pp, x_cowl_connect);
+                            
+                            % Store
+                            x_cowl_external = x_cowl_connect(:);
+                            y_cowl_external = y_cowl_connect(:);
+
+                            % Calculate cut positions
+                            x_cut = min(x_s) + baseline_results.params.truncation_percent*L_n/100;
+                            y_upper = interp1(x_s, y_s, x_cut, 'linear');
+
+                            % Dimensional Plot
+                            figure('Name', 'Plug Nozzle Dimensional', 'Position', [250, 250, 900, 700]);
+                            plot(x_s*1000, y_s*1000, '-r', 'LineWidth', 1.5);
+                            hold on;
+                            plot(x_s*1000, -y_s*1000, '-r', 'LineWidth', 1.5);
+                            for i = 1:length(x)
+                                plot([xt_s*1000,x_s(i)*1000], [yt_s*1000,y_s(i)*1000], '-k', 'LineWidth', 0.25);
+                                plot([xt_s*1000,x_s(i)*1000], -[yt_s*1000,y_s(i)*1000], '-k', 'LineWidth', 0.25);
+                            end
+                            plot([x_cut*1000, x_cut*1000], [-y_upper*1000, y_upper*1000], '-b', 'LineWidth', 1);
+                            plot(x_cowl_external*1000, y_cowl_external*1000, 'b-', 'LineWidth', 2);
+                            plot(x_cowl_external*1000, -y_cowl_external*1000, 'b-', 'LineWidth', 2); 
+                            % plot(x_wall_s*1000, y_wall_s*1000, 'b-', 'LineWidth', 1.5);
+                            % plot(x_wall_s*1000, -y_wall_s*1000, 'b-', 'LineWidth', 1.5);
+                            grid on;
+                            xlabel('X [mm]', 'FontSize', 12);
+                            ylabel('Y [mm]', 'FontSize', 12);
+                            title('Plug Nozzle - Dimensional', 'FontSize', 14, 'FontWeight', 'bold');
+                            axis equal;
+                            
+                            % Pressure Profile
+                            Ptot = p_tot_chamber_exit;
+                            P = Ptot./(1+(gamma-1)/2.*[M_i, M].^2).^((gamma)/(gamma-1));
+                            
+                            figure('Name', 'Pressure Profile', 'Position', [300, 300, 800, 500]);
+                            plot(x_s/L_n, P/101325, 'r-', 'LineWidth', 2);
+                            grid on;
+                            xlabel('X/L', 'FontSize', 12);
+                            ylabel('P [atm]', 'FontSize', 12);
+                            title('Profilo di pressione', 'FontSize', 14, 'FontWeight', 'bold');
+                            
+                            % Convergence History
+                            figure('Name', 'Convergence History', 'Position', [350, 350, 900, 600]);    
+                            plot(1:length(d_inlet_history), d_inlet_history*1000, 'b-o', 'LineWidth', 2, 'MarkerSize', 6);
+                            hold on;
+                            yline(d_inner*1000, 'r--', 'LineWidth', 2, 'DisplayName', 'Target');
+                            grid on;
+                            xlabel('Iteration', 'FontSize', 12);
+                            ylabel('d_{inlet} [mm]', 'FontSize', 12);
+                            title('Convergence of Inlet Diameter', 'FontSize', 14, 'FontWeight', 'bold');
+                            legend('Calculated', 'Target', 'Location', 'best');
+                            
+                            % =================================================================
+                            % OUTPUT STRUCTURE
+                            % =================================================================
+                            aerospike_geom = struct();
+                            aerospike_geom.xspike = x_s;
+                            aerospike_geom.yspike = y_s;
+                            aerospike_geom.xwalls = x_wall_s;  
+                            aerospike_geom.ywalls = y_wall_s;  
+                            aerospike_geom.xcowlexternal = x_cowl_external;
+                            aerospike_geom.ycowlexternal = y_cowl_external;
+                            aerospike_geom.x_cut = x_cut;
+                            aerospike_geom.y_cut = y_upper;
+                            aerospike_geom.Lspike = L_n;
+                            aerospike_geom.dy2 = dy2;
+                            aerospike_geom.x_spike_norm = x_s/L_n;
+                            aerospike_geom.M = M;
+                            aerospike_geom.theta = theta;
+                            aerospike_geom.mu = mu;
+                            aerospike_geom.beta = beta;
+                            aerospike_geom.NPR = NPR;
+                            aerospike_geom.M_exit_spike = M(end);
+                            aerospike_geom.M_inlet = M_nozzle_inlet;
+                            aerospike_geom.d_inner_target = d_inner;
+                            aerospike_geom.d_inlet_calculated = d_inlet_calculated;
+                            aerospike_geom.d_filling = d_filling;
+                            aerospike_geom.h = h;
+                            aerospike_geom.delta_a = delta_a;
+                            aerospike_geom.convergence_iterations = iteration;
+                            aerospike_geom.convergence_history = d_inlet_history;
+                            aerospike_geom.cut_d_out_percent = cut_d_out_percent;
+                        end
+                        if d_inlet_calculated > d_inner
+                            % Aerospike would be too big (experimental and not studied)
+                            h = h_initial;
+                            A_nozzle_inlet = pi*( ((d_inner/2) + h)^2 - (d_inner/2)^2 );
+                            AR_inlet = A_nozzle_inlet / A_star;
+                            M_nozzle_inlet = M_chamber_exit;
+                            M_i = M_nozzle_inlet;
+                            M = linspace(M_i, M_e, 1000);
+                            mu = asin(1./M);
+                            theta = sqrt((gamma + 1) / (gamma - 1)) .* atan(sqrt((gamma - 1) / (gamma + 1) * (M.^2 - 1))) - atan(sqrt(M.^2 - 1));
+                            theta_i = sqrt((gamma+1)/(gamma-1)) * atan(sqrt((gamma-1)/(gamma+1)*(M_i^2-1))) - atan(sqrt(M_i^2-1));
+                            theta = theta - theta_i;
+                            l = M(1)* h * ((1+(gamma-1)/2*M.^2)/(1+(gamma-1)/2*M(1).^2)).^((gamma+1)/(2*(gamma-1)));
+                            beta = mu - theta;
+                    
+                            % Local coordinates
+                            x = l.*cos(beta);
+                            y = l.*sin(beta);
+                        
+                            % Define throat walls
+                            L_wall = 2*h;
+                            x_wall = [-L_wall, 0, 0, -L_wall, -L_wall];
+                            y_wall = [0, 0, h, h, 0];
+                            
+                            % PREPEND the bottom-left wall point to spike geometry
+                            % Bottom point is at x_wall(1) = -L_wall, y_wall(1) = 0
+                            x = [x_wall(3); x(:)];  % Add wall bottom as first point
+                            y = [y_wall(3); y(:)];  % Add wall bottom as first point
+                            L = x(end) - x(1);
+                            
+                            % Translation
+                            x_p = x - x(end);
+                            y_p = y - y(end);
+                            yt_p = 0 - y(end);
+                            xt_p = 0 - x(end);
+                            x_wall_p = x_wall - x(end);
+                            y_wall_p = y_wall - y(end);
+                            
+                            % Rotation
+                            theta_end = theta(end);
+                            x_s = x_p * cos(theta_end) - y_p * sin(theta_end);
+                            y_s = x_p * sin(theta_end) + y_p * cos(theta_end);
+                            xt_s = xt_p * cos(theta_end) - yt_p * sin(theta_end);
+                            yt_s = xt_p * sin(theta_end) + yt_p * cos(theta_end);
+                            x_wall_s = x_wall_p * cos(theta_end) - y_wall_p * sin(theta_end);
+                            y_wall_s = x_wall_p * sin(theta_end) + y_wall_p * cos(theta_end);
+                            
+                            % Translation
+                            x_s = x_s - x_wall_s(3);
+                            xt_s = xt_s - x_wall_s(3);
+                            x_wall_s = x_wall_s - x_wall_s(3);
+                            L_n = abs(max(x_s) - min(x_s));
+                            
+                            d_inlet_calculated = 2 * abs(y_s(1));
+                            d_filling = d_inner - d_inlet_calculated;
+                            
+                            % Translation
+                            yt_s = yt_s - d_filling/2;
+                            y_s = y_s - d_filling/2;
+                            y_wall_s = y_wall_s - d_filling/2;
+
+                            % FILTER: Keep only points where y >= -d_inner (or adjust condition as needed)
+                            x_zero = interp1(y_s, x_s, 0, 'linear');
+                            M_zero = interp1(y_s(1:end-1), M(:), 0, 'linear');
+                            % Find indices where y satisfies the condition
+                            valid_idx = find(y_s <= 0);  % Keep points at or above -d_inner
+                            % Filter both x and y using the valid indices
+                            x_s = x_s(valid_idx);
+                            y_s = y_s(valid_idx);
+                            x_s = [x_s(:);x_zero];
+                            y_s = [y_s(:); 0];
+                            M = [M(valid_idx), M_zero];
+                            
+                            L_n = abs(max(x_s) - min(x_s));
+
+                            % EXTERNAL COWL GEOMETRY FOR ANNULAR AEROSPIKE
+                            % Point 1: Top of throat wall (horizontal exit)
+                            x1 = -cut_d_out_percent * L_chamber;
+                            y1 = -d_outer/2;
+                            dy1 = 0;  % Horizontal exit
+                            
+                            % Point 2: Match expansion slope
+                            x2 = x_wall_s(2);
+                            y2 = y_wall_s(2);
+                            dy2 = (y_s(2) - y_s(1)) / (x_s(2) - x_s(1));
+                            
+                            % Create spline with clamped derivatives
+                            x_ctrl = [x1, x2];
+                            y_ctrl = [y1, y2];
+                            n_spline = 40;
+                            
+                            x_cowl_connect = linspace(x1, x2, n_spline);
+                            
+                            % Use csape with 'clamped' - this is the proper way
+                            pp = csape(x_ctrl, y_ctrl, 'clamped', [dy1, dy2]);
+                            y_cowl_connect = ppval(pp, x_cowl_connect);
+                            
+                            % Store
+                            x_cowl_external = x_cowl_connect(:);
+                            y_cowl_external = y_cowl_connect(:);
+
+                            % Calculate cut positions
+                            x_cut = min(x_s) + baseline_results.params.truncation_percent*L_n/100;
+                            y_upper = interp1(x_s, y_s, x_cut, 'linear');
+
+                            % Dimensional Plot
+                            figure('Name', 'Plug Nozzle Dimensional', 'Position', [250, 250, 900, 700]);
+                            plot(x_s*1000, y_s*1000, '-r', 'LineWidth', 1.5);
+                            hold on;
+                            plot(x_s*1000, -y_s*1000, '-r', 'LineWidth', 1.5);
+                            for i = 1:length(x_s)
+                                plot([xt_s*1000,x_s(i)*1000], [yt_s*1000,y_s(i)*1000], '-k', 'LineWidth', 0.25);
+                                plot([xt_s*1000,x_s(i)*1000], -[yt_s*1000,y_s(i)*1000], '-k', 'LineWidth', 0.25);
+                            end
+                            plot([x_cut*1000, x_cut*1000], [-y_upper*1000, y_upper*1000], '-b', 'LineWidth', 1);
+                            plot(x_cowl_external*1000, y_cowl_external*1000, 'b-', 'LineWidth', 2);
+                            plot(x_cowl_external*1000, -y_cowl_external*1000, 'b-', 'LineWidth', 2); 
+                            % plot(x_wall_s*1000, y_wall_s*1000, 'b-', 'LineWidth', 1.5);
+                            % plot(x_wall_s*1000, -y_wall_s*1000, 'b-', 'LineWidth', 1.5);
+                            grid on;
+                            xlabel('X [mm]', 'FontSize', 12);
+                            ylabel('Y [mm]', 'FontSize', 12);
+                            title('Plug Nozzle - Dimensional', 'FontSize', 14, 'FontWeight', 'bold');
+                            axis equal;
+                            
+                            % Pressure Profile
+                            Ptot = p_tot_chamber_exit;
+                            P = Ptot./(1+(gamma-1)/2.*M.^2).^((gamma)/(gamma-1));
+                            
+                            figure('Name', 'Pressure Profile', 'Position', [300, 300, 800, 500]);
+                            plot(x_s/L_n, P/101325, 'r-', 'LineWidth', 2);
+                            grid on;
+                            xlabel('X/L', 'FontSize', 12);
+                            ylabel('P [atm]', 'FontSize', 12);
+                            title('Profilo di pressione', 'FontSize', 14, 'FontWeight', 'bold');
+                            
+                            % Convergence History
+                            figure('Name', 'Convergence History', 'Position', [350, 350, 900, 600]);    
+                            plot(1:length(d_inlet_history), d_inlet_history*1000, 'b-o', 'LineWidth', 2, 'MarkerSize', 6);
+                            hold on;
+                            yline(d_inner*1000, 'r--', 'LineWidth', 2, 'DisplayName', 'Target');
+                            grid on;
+                            xlabel('Iteration', 'FontSize', 12);
+                            ylabel('d_{inlet} [mm]', 'FontSize', 12);
+                            title('Convergence of Inlet Diameter', 'FontSize', 14, 'FontWeight', 'bold');
+                            legend('Calculated', 'Target', 'Location', 'best');
+                            
+                            % =================================================================
+                            % OUTPUT STRUCTURE
+                            % =================================================================
+                            aerospike_geom = struct();
+                            aerospike_geom.xspike = x_s;
+                            aerospike_geom.yspike = y_s;
+                            aerospike_geom.xwalls = x_wall_s;  
+                            aerospike_geom.ywalls = y_wall_s;  
+                            aerospike_geom.xcowlexternal = x_cowl_external;
+                            aerospike_geom.ycowlexternal = y_cowl_external;
+                            aerospike_geom.x_cut = x_cut;
+                            aerospike_geom.y_cut = y_upper;
+                            aerospike_geom.Lspike = L_n;
+                            aerospike_geom.dy2 = dy2;
+                            aerospike_geom.x_spike_norm = x_s/L_n;
+                            aerospike_geom.M = M;
+                            aerospike_geom.theta = theta;
+                            aerospike_geom.mu = mu;
+                            aerospike_geom.beta = beta;
+                            aerospike_geom.NPR = NPR;
+                            aerospike_geom.M_exit_spike = M(end);
+                            aerospike_geom.M_inlet = M_nozzle_inlet;
+                            aerospike_geom.d_inner_target = d_inner;
+                            aerospike_geom.d_inlet_calculated = d_inlet_calculated;
+                            aerospike_geom.d_filling = d_filling;
+                            aerospike_geom.h = h;
+                            aerospike_geom.delta_a = delta_a;
+                            aerospike_geom.convergence_iterations = iteration;
+                            aerospike_geom.convergence_history = d_inlet_history;
+                            aerospike_geom.cut_d_out_percent = cut_d_out_percent;
+                        end
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    
+    % =================================================================
+    % FINAL GEOMETRY CALCULATION WITH CONVERGED NPR
+    % =================================================================
+    
+    M_e = sqrt((2)/(gamma-1)*(NPR^((gamma-1)/(gamma))-1));
+    N = 30;
+    M_i = M_nozzle_inlet;
+    M = linspace(M_i, M_e, N);
+    mu = asin(1./M);
+    theta = sqrt((gamma + 1) / (gamma - 1)) .* atan(sqrt((gamma - 1) / (gamma + 1) * (M.^2 - 1))) - atan(sqrt(M.^2 - 1));
+    theta_i = sqrt((gamma+1)/(gamma-1)) * atan(sqrt((gamma-1)/(gamma+1)*(M_i^2-1))) - atan(sqrt(M_i^2-1));
+    theta = theta - theta_i;
+    theta_deg = theta * (180 / pi);
+    l = M(1)* h * ((1+(gamma-1)/2*M.^2)/(1+(gamma-1)/2*M(1).^2)).^((gamma+1)/(2*(gamma-1)));
+    beta = mu - theta;
+    
+    % Local coordinates
+    x = l.*cos(beta);
+    y = l.*sin(beta);
+
+    % Define throat walls
+    L_wall = 2*h;
+    x_wall = [-L_wall, 0, 0, -L_wall, -L_wall];
+    y_wall = [0, 0, h, h, 0];
+    
+    
+    % PREPEND the bottom-left wall point to spike geometry
+    % Bottom point is at x_wall(1) = -L_wall, y_wall(1) = 0
+    x = [x_wall(3); x(:)];  % Add wall bottom as first point
+    y = [y_wall(3); y(:)];  % Add wall bottom as first point
+
+    L = x(end) - x(1);
+    
+    
+    % Translation
+    x_p = x - x(end);
+    y_p = y - y(end);
+    yt_p = 0 - y(end);
+    xt_p = 0 - x(end);
+    x_wall_p = x_wall - x(end);
+    y_wall_p = y_wall - y(end);
+    
+    % Rotation
+    theta_end = theta(end);
+    x_s = x_p * cos(theta_end) - y_p * sin(theta_end);
+    y_s = x_p * sin(theta_end) + y_p * cos(theta_end);
+    xt_s = xt_p * cos(theta_end) - yt_p * sin(theta_end);
+    yt_s = xt_p * sin(theta_end) + yt_p * cos(theta_end);
+    x_wall_s = x_wall_p * cos(theta_end) - y_wall_p * sin(theta_end);
+    y_wall_s = x_wall_p * sin(theta_end) + y_wall_p * cos(theta_end);
+    
+    % Translation
+    x_s = x_s - x_wall_s(3);
+    xt_s = xt_s - x_wall_s(3);
+    x_wall_s = x_wall_s - x_wall_s(3);
+    
+
+    L_n = abs(max(x_s) - min(x_s));
+    
+    % Calculate cut positions
+    x_cut = min(x_s) + baseline_results.params.truncation_percent*L_n/100;
+    y_upper = interp1(x_s, y_s, x_cut, 'linear');
+
+    % EXTERNAL COWL GEOMETRY FOR ANNULAR AEROSPIKE
+    cut_d_out_percent = 0.5*h/L_chamber;
+    % Point 1: Top of throat wall (horizontal exit)
+    x1 = -cut_d_out_percent * L_chamber;
+    y1 = -d_outer/2;
+    dy1 = 0;  % Horizontal exit
+    
+    % Point 2: Match expansion slope
+    x2 = x_wall_s(2);
+    y2 = y_wall_s(2);
+    dy2 = (y_s(2) - y_s(1)) / (x_s(2) - x_s(1));
+    
+    % Create spline with clamped derivatives
+    x_ctrl = [x1, x2];
+    y_ctrl = [y1, y2];
+    n_spline = 50;
+    
+    x_cowl_connect = linspace(x1, x2, n_spline);
+    
+    % Use csape with 'clamped' - this is the proper way
+    pp = csape(x_ctrl, y_ctrl, 'clamped', [dy1, dy2]);
+    y_cowl_connect = ppval(pp, x_cowl_connect);
+    
+    % Store
+    x_cowl_external = x_cowl_connect(:);
+    y_cowl_external = y_cowl_connect(:);
+
+    
+
+    
+    % =================================================================
+    % PLOTTING
+    % =================================================================
+    
+    % % FIGURE 1: Local coordinate system
+    % figure('Name', 'Local Coordinate System', 'Position', [50, 50, 800, 600]);
+    % plot(x/L, y, '-r', 'LineWidth', 1.5);
+    % hold on;
+    % for i = 1:length(x)
+    %     plot([0, x(i)/L], [0, y(i)], '-k', 'LineWidth', 0.75);
+    % end
+    % plot(x_wall/L, y_wall, 'b-', 'LineWidth', 1.5);
+    % grid on;
+    % xlabel('X/L', 'FontSize', 12);
+    % ylabel('Y [m]', 'FontSize', 12);
+    % title('Sistema di riferimento locale', 'FontSize', 14, 'FontWeight', 'bold');
+    % 
+    % % FIGURE 2: Translation
+    % figure('Name', 'Translation', 'Position', [100, 100, 800, 600]);
+    % plot(x_p/L, y_p, '-r', 'LineWidth', 1.5);
+    % hold on;
+    % for i = 1:length(x)
+    %     plot([xt_p/L, x_p(i)/L], [yt_p, y_p(i)], '-k', 'LineWidth', 0.75);
+    % end
+    % plot(x_wall_p/L, y_wall_p, 'b-', 'LineWidth', 1.5);
+    % grid on;
+    % xlabel('X''/L', 'FontSize', 12);
+    % ylabel('Y'' [m]', 'FontSize', 12);
+    % title('Traslazione', 'FontSize', 14, 'FontWeight', 'bold');
+    % 
+    % % FIGURE 3: Rotation
+    % figure('Name', 'Rotation', 'Position', [150, 150, 800, 600]);
+    % plot(x_s/L_n, y_s, '-r', 'LineWidth', 1.5);
+    % hold on;
+    % for i = 1:length(x)
+    %     plot([xt_s(1)/L_n, x_s(i)/L_n], [yt_s(1), y_s(i)], '-k', 'LineWidth', 0.75);
+    % end
+    % plot(x_wall_s/L_n, y_wall_s, 'b-', 'LineWidth', 1.5);
+    % grid on;
+    % xlabel('X''''/L', 'FontSize', 12);
+    % ylabel('Y'''' [m]', 'FontSize', 12);
+    % title('Rotazione', 'FontSize', 14, 'FontWeight', 'bold');
+    % 
+    % % FIGURE 4: Complete Plug Nozzle (Normalized)
+    % figure('Name', 'Plug Nozzle Normalized', 'Position', [200, 200, 900, 700]);
+    % plot(x_s/L_n, y_s, '-r', 'LineWidth', 1.5);
+    % hold on;
+    % plot(x_s/L_n, -y_s, '-r', 'LineWidth', 1.5);
+    % plot([x_cut/L_n, x_cut/L_n], [-y_upper, y_upper], '-b', 'LineWidth', 1);
+    % for i = 1:length(x)
+    %     plot([xt_s(1)/L_n, x_s(i)/L_n], [yt_s(1), y_s(i)], '-k', 'LineWidth', 0.25);
+    %     plot([xt_s(1)/L_n, x_s(i)/L_n], -[yt_s(1), y_s(i)], '-k', 'LineWidth', 0.25);
+    % end
+    % plot(x_wall_s/L_n, y_wall_s, 'b-', 'LineWidth', 1.5);
+    % plot(x_wall_s/L_n, -y_wall_s, 'b-', 'LineWidth', 1.5);
+    % grid on;
+    % xlabel('X/L', 'FontSize', 12);
+    % ylabel('Y [m]', 'FontSize', 12);
+    % title(sprintf('Plug Nozzle | NPR=%.2f | M_e=%.3f | d_{inlet}=%.2f mm', NPR, M_e, d_inlet_calculated*1000), ...
+    %       'FontSize', 14, 'FontWeight', 'bold');
+    
+    % FIGURE 5: Dimensional Plot
+    figure('Name', 'Plug Nozzle Dimensional', 'Position', [250, 250, 900, 700]);
+    plot(x_s*1000, y_s*1000, '-r', 'LineWidth', 1.5);
+    hold on;
+    plot(x_s*1000, -y_s*1000, '-r', 'LineWidth', 1.5);
+    plot([x_cut*1000, x_cut*1000], [-y_upper*1000, y_upper*1000], '-b', 'LineWidth', 1);
+    for i = 1:length(x)
+        plot([xt_s*1000,x_s(i)*1000], [yt_s*1000,y_s(i)*1000], '-k', 'LineWidth', 0.25);
+        plot([xt_s*1000,x_s(i)*1000], -[yt_s*1000,y_s(i)*1000], '-k', 'LineWidth', 0.25);
+    end
+    plot(x_cowl_external*1000, y_cowl_external*1000, 'b-', 'LineWidth', 2);
+    plot(x_cowl_external*1000, -y_cowl_external*1000, 'b-', 'LineWidth', 2); 
+    % plot(x_wall_s*1000, y_wall_s*1000, 'b-', 'LineWidth', 1.5);
+    % plot(x_wall_s*1000, -y_wall_s*1000, 'b-', 'LineWidth', 1.5);
+    grid on;
+    xlabel('X [mm]', 'FontSize', 12);
+    ylabel('Y [mm]', 'FontSize', 12);
+    title('Plug Nozzle - Dimensional', 'FontSize', 14, 'FontWeight', 'bold');
+    axis equal;
+    
+    % FIGURE 6: Pressure Profile
+    Ptot = p_tot_chamber_exit;
+    P = Ptot./(1+(gamma-1)/2.*[M_i, M].^2).^((gamma)/(gamma-1));
+    
+    figure('Name', 'Pressure Profile', 'Position', [300, 300, 800, 500]);
+    plot(x_s/L_n, P/101325, 'r-', 'LineWidth', 2);
+    grid on;
+    xlabel('X/L', 'FontSize', 12);
+    ylabel('P [atm]', 'FontSize', 12);
+    title('Profilo di pressione', 'FontSize', 14, 'FontWeight', 'bold');
+    
+    % % FIGURE 7: Convergence History
+    % figure('Name', 'Convergence History', 'Position', [350, 350, 900, 600]);    
+    % plot(1:length(d_inlet_history), d_inlet_history*1000, 'b-o', 'LineWidth', 2, 'MarkerSize', 6);
+    % hold on;
+    % yline(d_inner*1000, 'r--', 'LineWidth', 2, 'DisplayName', 'Target');
+    % grid on;
+    % xlabel('Iteration', 'FontSize', 12);
+    % ylabel('d_{inlet} [mm]', 'FontSize', 12);
+    % title('Convergence of Inlet Diameter', 'FontSize', 14, 'FontWeight', 'bold');
+    % legend('Calculated', 'Target', 'Location', 'best');
+    
+    % =================================================================
+    % OUTPUT STRUCTURE
+    % =================================================================
+    aerospike_geom = struct();
+    aerospike_geom.xspike = x_s;
+    aerospike_geom.yspike = y_s;
+    aerospike_geom.xwalls = x_wall_s;  
+    aerospike_geom.ywalls = y_wall_s; 
+    aerospike_geom.xcowlexternal = x_cowl_external;
+    aerospike_geom.ycowlexternal = y_cowl_external;
+    aerospike_geom.x_cut = x_cut;
+    aerospike_geom.y_cut = y_upper;
+    aerospike_geom.dy2 = dy2;
+    aerospike_geom.Lspike = L_n;
+    aerospike_geom.x_spike_norm = x_s/L_n;
+    aerospike_geom.M = M;
+    aerospike_geom.theta = theta;
+    aerospike_geom.mu = mu;
+    aerospike_geom.beta = beta;
+    aerospike_geom.NPR = NPR;
+    aerospike_geom.M_exit_spike = M(end);
+    aerospike_geom.M_inlet = M_nozzle_inlet;
+    aerospike_geom.d_inner_target = d_inner;
+    aerospike_geom.d_inlet_calculated = d_inlet_calculated;
+    aerospike_geom.d_filling = 0;
+    aerospike_geom.h = h;
+    aerospike_geom.delta_a = delta_a;
+    aerospike_geom.convergence_iterations = iteration;
+    aerospike_geom.convergence_history = d_inlet_history;
+    aerospike_geom.cut_d_out_percent = cut_d_out_percent;
+    % 
+    % 
+    % fprintf('\n========== FINAL SUMMARY ==========\n');
+    % fprintf('NPR:                       %.4f\n', NPR);
+    % fprintf('Exit Mach:                 M_e = %.4f\n', M_e);
+    % fprintf('Inlet Mach:                M_inlet = %.4f\n', M_nozzle_inlet);
+    % fprintf('Target inner diameter:     d_inner = %.4f m (%.2f mm)\n', d_inner, d_inner*1000);
+    % fprintf('Calculated inlet diameter: d_inlet = %.4f m (%.2f mm)\n', d_inlet_calculated, d_inlet_calculated*1000);
+    % fprintf('Error:                     %.6f m (%.4f mm)\n', abs(d_inlet_calculated - d_inner), abs(d_inlet_calculated - d_inner)*1000);
+    % fprintf('Spike length:              L = %.4f m (%.2f mm)\n', L_n, L_n*1000);
+    % fprintf('Convergence iterations:    %d\n', iteration);
+    % fprintf('===================================\n\n');
+    
+end
+
+% Mach number to Prandtl-Meyer angle
+function nu = Mach2Prandtl(M, gamma) 
+    f1 = sqrt((gamma + 1) / (gamma - 1));
+    f2 = sqrt((gamma - 1) / (gamma + 1));
+    nu = f1 * atan(f2 * sqrt((M.^2) - 1)) - atan(sqrt((M.^2) - 1));
+end
+
+% Mach number to area ratio (AR)
+function AR = Mach2AR(M, gamma)
+    f1 = 2 / (gamma + 1);
+    f2 = (gamma - 1) / 2;
+    f3 = (gamma + 1) / (gamma - 1);
+    AR = sqrt((1 ./ (M.^2)) .* ((f1 .* (1 + (f2 .* (M.^2)))).^f3));
+end
+
+function plot_chamber_geometry(params)
+    % Plot RDE chamber geometry showing annular configuration
+    
+    % Extract geometric parameters
+    r_outer = params.d_outer / 2;  % Outer radius [m]
+    r_inner = params.d_inner / 2;  % Inner radius [m]
+    L = params.L;                   % Length [m]
+    
+    % Create figure
+    figure('Position', [100, 100, 800, 700]);
+    
+    % --- Subplot 1: Cross-sectional view (looking down the axis) ---
+    subplot(1, 2, 1);
+    
+    % Create circles for outer and inner walls
+    theta_circle = linspace(0, 2*pi, 100);
+    
+    % Outer circle
+    x_outer = r_outer * cos(theta_circle);
+    y_outer = r_outer * sin(theta_circle);
+    
+    % Inner circle
+    x_inner = r_inner * cos(theta_circle);
+    y_inner = r_inner * sin(theta_circle);
+    
+    % Plot
+    plot(x_outer, y_outer, 'b-', 'LineWidth', 2); hold on;
+    plot(x_inner, y_inner, 'b-', 'LineWidth', 2);
+    
+    % Fill annular region
+    fill(x_outer, y_outer, [0.7 0.85 1], 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+    fill(x_inner, y_inner, 'w', 'EdgeColor', 'none');
+    
+    % Add dimensions
+    plot([0, 0], [0, r_outer], 'r--', 'LineWidth', 1.5);
+    plot([0, r_inner], [0, 0], 'k--', 'LineWidth', 1.5);
+    
+    text(0.003, r_outer/2, sprintf('r_{outer} = %.1f mm', r_outer*1000), ...
+         'FontSize', 10, 'Color', 'r');
+    text(r_inner/2, -0.006, sprintf('r_{inner} = %.1f mm', r_inner*1000), ...
+         'FontSize', 10, 'Color', 'k');
+    
+    % Formatting
+    axis equal;
+    grid on;
+    xlabel('x [m]');
+    ylabel('y [m]');
+    title('Cross-Sectional View (Annular Channel)');
+    xlim([-r_outer*1.2, r_outer*1.2]);
+    ylim([-r_outer*1.2, r_outer*1.2]);
+    
+    % --- Subplot 2: Side view (axial cut) ---
+    subplot(1, 2, 2);
+    
+    % Outer wall rectangle
+    rectangle('Position', [0, -r_outer, L, 2*r_outer], ...
+              'FaceColor', [0.7 0.85 1], 'FaceAlpha', 0.3, ...
+              'EdgeColor', 'b', 'LineWidth', 2);
+    hold on;
+    
+    % Inner wall rectangle (white to show hollow)
+    rectangle('Position', [0, -r_inner, L, 2*r_inner], ...
+              'FaceColor', 'w', ...
+              'EdgeColor', 'b', 'LineWidth', 2);
+    
+    % Add dimension lines
+    plot([0, L], [r_outer*1.1, r_outer*1.1], 'r-', 'LineWidth', 1.5);
+    plot([0, 0], [r_outer*1.05, r_outer*1.15], 'r-', 'LineWidth', 1.5);
+    plot([L, L], [r_outer*1.05, r_outer*1.15], 'r-', 'LineWidth', 1.5);
+    
+    text(L/2, r_outer*1.18, sprintf('L = %.1f mm', L*1000), ...
+         'FontSize', 10, 'Color', 'r', 'HorizontalAlignment', 'center');
+    
+    % Annulus thickness annotation
+    plot([L*1.05, L*1.05], [r_inner, r_outer], 'k-', 'LineWidth', 1.5);
+    plot([L*1.02, L*1.08], [r_inner, r_inner], 'k-', 'LineWidth', 1.5);
+    plot([L*1.02, L*1.08], [r_outer, r_outer], 'k-', 'LineWidth', 1.5);
+    
+    text(L*1.12, (r_outer+r_inner)/2, sprintf('\\delta_a = %.1f mm', params.delta_a*1000), ...
+         'FontSize', 10, 'Color', 'k');
+    
+    % Formatting
+    axis equal;
+    grid on;
+    xlabel('Axial Position z [m]');
+    ylabel('Radial Position r [m]');
+    title('Axial Cross-Section (Side View)');
+    xlim([-L*0.1, L*1.2]);
+    ylim([-r_outer*1.3, r_outer*1.3]);
+    
+    % Overall title
+    sgtitle(sprintf('RDE Chamber Geometry | D_{outer}=%.0f mm | D_{inner}=%.0f mm | L=%.0f mm', ...
+            params.d_outer*1000, params.d_inner*1000, params.L*1000), ...
+            'FontSize', 12, 'FontWeight', 'bold');
+    
+    fprintf('Chamber geometry plotted.\n');
+end
+
+function plot_chamber_with_aerospike(aerospike_geom, baseline_params)
+    % Plot axial cross-section of RDE chamber with aerospike nozzle
+    % Shows correct dimensional geometry including throat walls (x_wall_s, y_wall_s)
+    
+    % Extract chamber parameters
+    Lchamber = baseline_params.L;
+    douter = baseline_params.d_outer;
+    dinner = baseline_params.d_inner;
+    cut_d_out_percent = aerospike_geom.cut_d_out_percent;
+    % Extract aerospike geometry
+    Lspike = aerospike_geom.Lspike;
+    
+    % Spike coordinates (already in meters)
+    xs = aerospike_geom.xspike;
+    ys = aerospike_geom.yspike;
+    
+    % Throat walls (rotated/transformed, in meters)
+    xwalls = aerospike_geom.xwalls;
+    ywalls = aerospike_geom.ywalls;
+    % External cowl (rotated/transformed, in meters)
+    x_cowl_external = aerospike_geom.xcowlexternal;
+    y_cowl_external = aerospike_geom.ycowlexternal;
+
+    x_cut = aerospike_geom.x_cut + Lchamber;
+    y_cut = aerospike_geom.y_cut;
+    
+    % Position spike starting at chamber end
+    xspike = xs + Lchamber;
+    yspike = ys;
+    xwalls_plot = xwalls + Lchamber;
+    ywalls_plot = ywalls;
+    x_cowl_external_plot = x_cowl_external + Lchamber;
+    y_cowl_external_plot = y_cowl_external;    
+    
+    % Create figure
+    figure('Name', 'RDE Chamber with Aerospike', 'Position', [100, 100, 800, 700]);
+    
+    % =================================================================
+    % PLOT UPPER HALF
+    % =================================================================
+    
+    % Chamber outer wall (with removing of last 5% for external cowl
+    plot([0, Lchamber*(1-cut_d_out_percent)], [douter/2, douter/2], 'b-', 'LineWidth', 2.5);
+    hold on;
+    
+    % Chamber inner wall
+    plot([0, Lchamber], [dinner/2, dinner/2], 'b-', 'LineWidth', 2.5);
+
+    % Chamber base wall
+    plot([0, 0], [douter/2, -douter/2], 'b-', 'LineWidth', 1.5);
+
+    % Aerospike contour (upper surface)
+    plot(xspike, -yspike, 'r-', 'LineWidth', 2.5);
+    plot([xspike(end); xspike(end)], [-yspike(end);0], 'r-', 'LineWidth', 2.5);
+
+    % Truncated aerospike all (up and down)
+    plot([x_cut, x_cut], [-y_cut, y_cut], 'r-', 'LineWidth', 1.5);
+
+    % % Throat walls (upper)
+    % plot(xwalls_plot, -ywalls_plot, 'b-', 'LineWidth', 2.0);
+
+    % External cowl (upper)
+    plot(x_cowl_external_plot, -y_cowl_external_plot, 'k-', 'LineWidth', 2.5);
+    
+    % Cowl/outer expansion wall (dashed line from chamber end to spike end)
+    plot([Lchamber, Lchamber + Lspike], [douter/2, douter/2], 'b--', 'LineWidth', 1.5);
+    
+    % =================================================================
+    % PLOT LOWER HALF (MIRROR SYMMETRY)
+    % =================================================================
+    
+    % Chamber outer wall (with removing of last 5% for external cowl)
+    plot([0, Lchamber*(1-cut_d_out_percent)], [-douter/2, -douter/2], 'b-', 'LineWidth', 2.5);
+    
+    % Chamber inner wall
+    plot([0, Lchamber], [-dinner/2, -dinner/2], 'b-', 'LineWidth', 2.5);
+    
+    % Aerospike contour (lower surface)
+    plot(xspike, yspike, 'r-', 'LineWidth', 2.5);
+    plot([xspike(end); xspike(end)], [yspike(end);0], 'r-', 'LineWidth', 2.5);
+    
+    % % Throat walls (lower)
+    % plot(xwalls_plot, ywalls_plot, 'b-', 'LineWidth', 2.0);
+
+    % External cowl (lower)
+    plot(x_cowl_external_plot, y_cowl_external_plot, 'k-', 'LineWidth', 2.5);
+    
+    % Cowl/outer expansion wall
+    plot([Lchamber, Lchamber + Lspike], [-douter/2, -douter/2], 'b--', 'LineWidth', 1.5);
+    
+    % =================================================================
+    % ADD DIMENSION ANNOTATIONS
+    % =================================================================
+    
+    % Chamber length
+    ydim = douter/2 * 1.25;
+    plot([0, Lchamber], [ydim, ydim], 'k-', 'LineWidth', 1.2);
+    plot([0, 0], [ydim*0.97, ydim*1.03], 'k-', 'LineWidth', 1.2);
+    plot([Lchamber, Lchamber], [ydim*0.97, ydim*1.03], 'k-', 'LineWidth', 1.2);
+    text(Lchamber/2, ydim*1.08, sprintf('L_{chamber} = %.0f mm', Lchamber*1000), ...
+        'HorizontalAlignment', 'center', 'FontSize', 10, 'FontWeight', 'bold');
+    
+    % Spike length
+    ydim2 = -douter/2 * 1.25;
+    plot([Lchamber, Lchamber + Lspike], [ydim2, ydim2], 'k-', 'LineWidth', 1.2);
+    plot([Lchamber, Lchamber], [ydim2*0.97, ydim2*1.03], 'k-', 'LineWidth', 1.2);
+    plot([Lchamber + Lspike, Lchamber + Lspike], [ydim2*0.97, ydim2*1.03], 'k-', 'LineWidth', 1.2);
+    text(Lchamber + Lspike/2, ydim2*1.08, sprintf('L_{spike} = %.0f mm', Lspike*1000), ...
+        'HorizontalAlignment', 'center', 'FontSize', 10, 'FontWeight', 'bold');
+    
+    % Outer diameter
+    xdim = Lchamber * 1.08;
+    plot([xdim, xdim], [-douter/2, douter/2], 'k-', 'LineWidth', 1.2);
+    plot([xdim*0.995, xdim*1.005], [douter/2, douter/2], 'k-', 'LineWidth', 1.2);
+    plot([xdim*0.995, xdim*1.005], [-douter/2, -douter/2], 'k-', 'LineWidth', 1.2);
+    text(xdim*1.03, 0, sprintf('D_{outer} = %.0f mm', douter*1000), ...
+        'FontSize', 10, 'Rotation', 90, 'HorizontalAlignment', 'center', 'FontWeight', 'bold');
+    
+    % Inner diameter at spike base
+    xdim2 = Lchamber * 0.92;
+    plot([xdim2, xdim2], [-dinner/2, dinner/2], 'k--', 'LineWidth', 1.0);
+    plot([xdim2*0.995, xdim2*1.005], [dinner/2, dinner/2], 'k--', 'LineWidth', 1.0);
+    plot([xdim2*0.995, xdim2*1.005], [-dinner/2, -dinner/2], 'k--', 'LineWidth', 1.0);
+    text(xdim2*0.95, 0, sprintf('D_{inner} = %.0f mm', dinner*1000), ...
+        'FontSize', 9, 'Rotation', 90, 'HorizontalAlignment', 'center', 'Color', [0.3 0.3 0.3]);
+    
+    % Throat height annotation
+    h = aerospike_geom.h;
+    xh1 = Lchamber;
+    xh2 = x_cowl_external_plot(end);
+    yh2 = -y_cowl_external_plot(end);
+    plot([xh1, xh2], [dinner/2, yh2], 'r--', 'LineWidth', 1.0);
+    plot([xh1*0.998, xh1*1.002], [dinner/2, dinner/2], 'r-', 'LineWidth', 1.0);
+    plot([xh2*0.998, xh2*1.002], [yh2, yh2], 'r-', 'LineWidth', 1.0);
+    text((xh1+xh2+0.001)/2, (yh2+dinner/2)/2, sprintf('h = %.1f mm', h*1000), ...
+        'FontSize', 9, 'Color', 'r', 'HorizontalAlignment', 'left', 'FontWeight', 'bold');
+    
+    % =================================================================
+    % ADD LABELS AND ANNOTATIONS
+    % =================================================================
+    
+    % RDE Chamber label
+    text(Lchamber/2, 0, 'RDE Chamber', 'FontSize', 12, 'FontWeight', 'bold', ...
+        'HorizontalAlignment', 'center', 'BackgroundColor', [1 1 1 0.8], ...
+        'EdgeColor', 'b', 'LineWidth', 1.2);
+    
+    % Aerospike Nozzle label
+    text(Lchamber + Lspike*0.35, 0, 'Aerospike Nozzle', 'FontSize', 12, 'FontWeight', 'bold', ...
+        'HorizontalAlignment', 'center', 'BackgroundColor', [1 1 1 0.8], ...
+        'EdgeColor', 'r', 'Color', 'r', 'LineWidth', 1.2);
+    
+    % =================================================================
+    % FORMATTING
+    % =================================================================
+    
+    axis equal;
+    grid on;
+    xlabel('Axial Position [m]', 'FontSize', 12);
+    ylabel('Radial Position [m]', 'FontSize', 12);
+    title(sprintf('RDE with Aerospike Nozzle | M_{exit} = %.2f | NPR = %.2f | L_{spike}/L_{chamber} = %.2f', ...
+        aerospike_geom.M_exit_spike, aerospike_geom.NPR, Lspike/Lchamber), ...
+        'FontSize', 14, 'FontWeight', 'bold');
+    
+    % Set appropriate axis limits
+    xlim([-Lchamber*0.05, Lchamber + Lspike*1.05]);
+    
+    hold off;
+    
+    % % Print summary
+    % fprintf('\n=== RDE Chamber with Aerospike Geometry ===\n');
+    % fprintf('Chamber length:      %.1f mm\n', Lchamber*1000);
+    % fprintf('Chamber D_outer:     %.1f mm\n', douter*1000);
+    % fprintf('Chamber D_inner:     %.1f mm\n', dinner*1000);
+    % fprintf('Spike length:        %.1f mm\n', Lspike*1000);
+    % fprintf('Throat height (h):   %.2f mm\n', h*1000);
+    % fprintf('Exit Mach:           M_e = %.3f\n', aerospike_geom.M_exit_spike);
+    % fprintf('NPR:                 %.2f\n', aerospike_geom.NPR);
+    % fprintf('Length ratio:        L_spike/L_chamber = %.3f\n', Lspike/Lchamber);
+    % fprintf('===========================================\n\n');
+    
+end
+
+function results = calculate_aerospike_performance(aerospike_geom, baseline_results)
+    % CALCULATE AEROSPIKE PERFORMANCE WITH COMPREHENSIVE COMPARISON
+    % All-in-one function: calculates thrust for full and truncated spike, prints table
+    %
+    % Inputs:
+    %   aerospike_geom - Aerospike geometry structure from run_aerospike_implementation
+    %   baseline_results - RDE baseline results (contains params with truncation_percent)
+    %
+    % Outputs:
+    %   results - Structure containing:
+    %             .thrust_full - Full spike (100%) results
+    %             .thrust_trunc - Truncated spike results
+    %             .aerospike_geom - Aerospike geometry (passed through)
+    
+    % =================================================================
+    % EXTRACT BASELINE (NO NOZZLE) PERFORMANCE
+    % =================================================================
+    perf_no_nozzle = baseline_results.performance;
+    flow_no_nozzle = baseline_results.flow;
+    exit_no_nozzle = baseline_results.exit;
+    
+    % Get truncation percentage
+    if isfield(baseline_results.params, 'truncation_percent')
+        trunc_percent = baseline_results.params.truncation_percent;
+    else
+        trunc_percent = 100;
+    end
+    
+    fprintf('\n');
+    fprintf('╔════════════════════════════════════════════════════════════════════════════════════════╗\n');
+    fprintf('║                      AEROSPIKE PERFORMANCE CALCULATION                                 ║\n');
+    fprintf('╚════════════════════════════════════════════════════════════════════════════════════════╝\n');
+    fprintf('\n');
+    
+    % =================================================================
+    % STEP 1: CALCULATE FULL SPIKE (100%) THRUST
+    % =================================================================
+    fprintf('STEP 1: Calculating full spike (100%%) thrust...\n');
+    thrust_full = calculate_thrust_internal(aerospike_geom, baseline_results, 100);
+    fprintf('   ✓ Full spike thrust: %.1f N (Isp_z: %.1f s)\n\n', thrust_full.F_total, thrust_full.Isp_z);
+    
+    % =================================================================
+    % STEP 2: CALCULATE TRUNCATED SPIKE THRUST
+    % =================================================================
+    fprintf('STEP 2: Calculating truncated spike (%.0f%%) thrust...\n', trunc_percent);
+    thrust_trunc = calculate_thrust_internal(aerospike_geom, baseline_results, trunc_percent);
+    fprintf('   ✓ Truncated spike thrust: %.1f N (Isp_z: %.1f s)\n\n', thrust_trunc.F_total, thrust_trunc.Isp_z);
+    
+    % =================================================================
+    % STEP 3: PRINT COMPARISON TABLE
+    % =================================================================
+    fprintf('STEP 3: Generating performance comparison table...\n\n');
+    
+    % Calculate improvements
+    thrust_improvement_full = ((thrust_full.F_total - perf_no_nozzle.thrust) / perf_no_nozzle.thrust) * 100;
+    thrust_improvement_trunc = ((thrust_trunc.F_total - perf_no_nozzle.thrust) / perf_no_nozzle.thrust) * 100;
+    
+    Isp_z_improvement_full = ((thrust_full.Isp_z - perf_no_nozzle.Isp_z) / perf_no_nozzle.Isp_z) * 100;
+    Isp_z_improvement_trunc = ((thrust_trunc.Isp_z - perf_no_nozzle.Isp_z) / perf_no_nozzle.Isp_z) * 100;
+    
+    Isp_f_improvement_full = ((thrust_full.Isp_f - perf_no_nozzle.Isp_f) / perf_no_nozzle.Isp_f) * 100;
+    Isp_f_improvement_trunc = ((thrust_trunc.Isp_f - perf_no_nozzle.Isp_f) / perf_no_nozzle.Isp_f) * 100;
+    
+    I_tot_improvement_full = ((thrust_full.I_tot - perf_no_nozzle.I_tot) / perf_no_nozzle.I_tot) * 100;
+    I_tot_improvement_trunc = ((thrust_trunc.I_tot - perf_no_nozzle.I_tot) / perf_no_nozzle.I_tot) * 100;
+    
+    % =================================================================
+    % PRINT TABLE
+    % =================================================================
+    fprintf('╔════════════════════════════════════════════════════════════════════════════════════════╗\n');
+    fprintf('║                           PERFORMANCE COMPARISON TABLE                                 ║\n');
+    fprintf('╚════════════════════════════════════════════════════════════════════════════════════════╝\n');
+    fprintf('\n');
+    fprintf('┌────────────────────────────────┬─────────────────────┬─────────────────────┬──────────────┐\n');
+    fprintf('│ Parameter                      │ Full Spike (Δ%%)     │ Trunc %.0f%% (Δ%%)      │  No Nozzle   │\n', trunc_percent);
+    fprintf('├────────────────────────────────┼─────────────────────┼─────────────────────┼──────────────┤\n');
+    
+    % Thrust
+    fprintf('│ Thrust [N]                     │  %8.1f (%+6.1f%%) │  %8.1f (%+6.1f%%) │ %12.1f │\n', ...
+        thrust_full.F_total, thrust_improvement_full, ...
+        thrust_trunc.F_total, thrust_improvement_trunc, ...
+        perf_no_nozzle.thrust);
+    
+    % Isp_z
+    fprintf('│ Isp_z [s]                      │  %8.1f (%+6.1f%%) │  %8.1f (%+6.1f%%) │ %12.1f │\n', ...
+        thrust_full.Isp_z, Isp_z_improvement_full, ...
+        thrust_trunc.Isp_z, Isp_z_improvement_trunc, ...
+        perf_no_nozzle.Isp_z);
+    
+    % Isp_f
+    fprintf('│ Isp_f [s]                      │  %8.1f (%+6.1f%%) │  %8.1f (%+6.1f%%) │ %12.1f │\n', ...
+        thrust_full.Isp_f, Isp_f_improvement_full, ...
+        thrust_trunc.Isp_f, Isp_f_improvement_trunc, ...
+        perf_no_nozzle.Isp_f);
+    
+    % I_tot
+    fprintf('│ I_tot [N·s]                    │ %8.1f (%+6.1f%%) │ %8.1f (%+6.1f%%) │ %12.1f │\n', ...
+        thrust_full.I_tot, I_tot_improvement_full, ...
+        thrust_trunc.I_tot, I_tot_improvement_trunc, ...
+        perf_no_nozzle.I_tot);
+    
+    
+    fprintf('├────────────────────────────────┼─────────────────────┼─────────────────────┼──────────────┤\n');
+    
+    % Exit conditions
+    fprintf('│ Exit Mach Number               │ %19.3f │ %19.3f │ %12.3f │\n', ...
+        thrust_full.M_exit, thrust_trunc.M_exit, mean(exit_no_nozzle.M_exit));
+    
+    fprintf('│ Exit Pressure [atm]            │ %19.3f │ %19.3f │ %12.3f │\n', ...
+        thrust_full.P_exit/101325, thrust_trunc.P_exit/101325, mean(exit_no_nozzle.P)/101325);
+    
+    fprintf('│ Exit Temperature [K]           │ %19.1f │ %19.1f │ %12.1f │\n', ...
+        thrust_full.T_exit, thrust_trunc.T_exit, mean(exit_no_nozzle.T));
+    
+    fprintf('│ Exit Velocity [m/s]            │ %19.1f │ %19.1f │ %12.1f │\n', ...
+        thrust_full.V_exit, thrust_trunc.V_exit, mean(exit_no_nozzle.Vz));
+    
+    fprintf('├────────────────────────────────┼─────────────────────┼─────────────────────┼──────────────┤\n');
+    
+    % Aerospike-specific parameters
+    fprintf('│ Spike Length [mm]              │ %19.1f │ %19.1f │ %12s │\n', ...
+        aerospike_geom.Lspike*1000, thrust_trunc.L_active*1000, '-');
+    
+    fprintf('│ Throat Height h [mm]           │ %19.2f │ %19.2f │ %12s │\n', ...
+        aerospike_geom.h*1000, aerospike_geom.h*1000, '-');
+    
+    fprintf('│ NPR (P0/Pback)                 │ %19.2f │ %19.2f │ %12s │\n', ...
+        aerospike_geom.NPR, aerospike_geom.NPR, '-');
+    
+    fprintf('└────────────────────────────────┴─────────────────────┴─────────────────────┴──────────────┘\n');
+    fprintf('\n');
+    
+    % =================================================================
+    % OUTPUT STRUCTURE
+    % =================================================================
+    results = struct();
+    results.thrust_full = thrust_full;
+    results.thrust_trunc = thrust_trunc;
+    results.aerospike_geom = aerospike_geom;
+    results.thrust_improvement_full = thrust_improvement_full;
+    results.thrust_improvement_trunc = thrust_improvement_trunc;
+    results.Isp_z_improvement_full = Isp_z_improvement_full;
+    results.Isp_z_improvement_trunc = Isp_z_improvement_trunc;
+    
+    % =================================================================
+    % NESTED FUNCTION: CALCULATE THRUST (INTERNAL)
+    % =================================================================
+    function thrust_results = calculate_thrust_internal(aero_geom, base_results, truncation_pct)
+        % Internal function to calculate thrust for given truncation
+        % Based on NASA TM 110326 aerospike thrust methodology
+        
+        % Extract parameters
+        gamma = base_results.detonation.gamma2;
+        R = base_results.detonation.R2;
+        P_back = base_results.params.P_back;
+        
+        % Chamber exit conditions (thruster exit)
+        P0_inlet = mean(base_results.exit.P0);
+        T0_inlet = mean(base_results.exit.T0);
+        rho0_inlet = mean(base_results.exit.rho0);
+        M_inlet = aero_geom.M_inlet;  % Actual Mach at chamber exit
+        
+        % Mass flow from chamber (conserved)
+        mdot = base_results.performance.mass_flow_exit;
+        
+        % Aerospike geometry
+        x_spike = aero_geom.xspike;
+        y_spike = aero_geom.yspike;
+        L_spike = aero_geom.Lspike;
+        y_wall_s = aero_geom.ywalls(2);    % Y Origin of Characteristics
+        x_wall_s = aero_geom.xwalls(2);  % X Origin of Characteristics
+        h = aero_geom.h;
+        d_inner = aero_geom.d_inner_target;
+        d_filling = aero_geom.d_filling;
+        M = aero_geom.M;
+        N = length(M);
+        theta = aero_geom.theta;
+       
+        flow_angle = theta - theta(end);
+        
+        % Thruster exit properties using actual Mach number
+        T_exit_thruster = T0_inlet / (1 + 0.5*(gamma-1)*M_inlet^2);
+        P_exit_thruster = P0_inlet / (1 + 0.5*(gamma-1)*M_inlet^2)^(gamma/(gamma-1));
+        rho_exit_thruster = rho0_inlet / (1 + 0.5*(gamma-1)*M_inlet^2)^(1/(gamma-1));
+        V_exit_thruster = sqrt(gamma * R * T_exit_thruster) * M_inlet;
+        
+        
+        
+        % Truncation handling
+        if truncation_pct < 100
+            L_truncated = L_spike * (truncation_pct / 100);
+            idx_trunc = find((x_spike - (min(x_spike) + L_truncated)) > 0, 1, 'first');
+            idx_trunc = idx_trunc-1;
+            y_end_trunc = interp1(x_spike, y_spike, L_truncated, 'linear');
+            x_spike_trunc = [x_spike(1:idx_trunc); L_truncated];
+            y_spike_trunc = [y_spike(1:idx_trunc); y_end_trunc];
+            M_end_trunc = interp1(x_spike, [M(1); M(:)], L_truncated, 'linear');
+            M_trunc = [M(1:idx_trunc)'; M_end_trunc];
+            N_trunc = length(M_trunc);
+            M_trunc_exit = M_trunc(end);
+            M_all = [M_trunc; M(idx_trunc+1:end)'];
+            N_all = length(M_all);
+            flow_angle_end = flow_angle(idx_trunc); 
+
+            % Calculate flow properties along spike
+            P_all = zeros(1, N_all);
+            T_all = zeros(1, N_all);
+            rho_all = zeros(1, N_all);
+            V_all = zeros(1, N_all);
+
+            for i = 1:N_all
+                % Isentropic relations from chamber stagnation conditions
+                T_ratio_all = 1 / (1 + 0.5*(gamma-1)*M_all(i)^2);
+                P_ratio_all = T_ratio_all^(gamma/(gamma-1));
+                rho_ratio_all = T_ratio_all^(1/(gamma-1));
+                
+                T_all(i) = T0_inlet * T_ratio_all;
+                P_all(i) = P0_inlet * P_ratio_all;
+                rho_all(i) = rho0_inlet * rho_ratio_all;
+                
+                a_all = sqrt(gamma * R * T_all(i));
+                V_all(i) = M_all(i) * a_all;
+            end
+            
+        else
+            x_spike_trunc = x_spike;
+            y_spike_trunc = y_spike;
+            M_trunc = M;
+            N_trunc = N;
+            M_trunc_exit = M(end);
+            L_truncated = L_spike;
+            flow_angle_end = flow_angle(end);
+        end
+        
+        % Calculate flow properties along spike
+        P = zeros(1, N_trunc);
+        T = zeros(1, N_trunc);
+        rho = zeros(1, N_trunc);
+        V = zeros(1, N_trunc);
+        
+        for i = 1:N_trunc
+            % Isentropic relations from chamber stagnation conditions
+            T_ratio = 1 / (1 + 0.5*(gamma-1)*M_trunc(i)^2);
+            P_ratio = T_ratio^(gamma/(gamma-1));
+            rho_ratio = T_ratio^(1/(gamma-1));
+            
+            T(i) = T0_inlet * T_ratio;
+            P(i) = P0_inlet * P_ratio;
+            rho(i) = rho0_inlet * rho_ratio;
+            
+            a = sqrt(gamma * R * T(i));
+            V(i) = M_trunc(i) * a;
+        end
+        
+        % Exit properties
+        P_exit = P(end);
+        T_exit = T(end);
+        V_exit = V(end);
+        
+        % === THRUST CALCULATION ===
+        
+        % Thruster exit area (annular)
+        A_exit = pi * ((y_wall_s)^2 - (y_spike_trunc(end))^2);
+        
+        if truncation_pct < 100
+             % Characteristics start at (x_wall_s,y_wall_s) to (x_spike(i), y_spike(i)) where x_spike(i) > L_truncated
+            y_char_intersections = [y_end_trunc];
+            for i = 1:length(x_spike)
+                if x_spike(i) > L_truncated
+                    x1 = x_wall_s; y1 = y_wall_s;
+                    x2 = x_spike(i); y2 = y_spike(i);
+                    % Linear interpolate intersection with x = L_truncated
+                    s = (L_truncated - x1) / (x2 - x1);
+                    y_int = y1 + s*(y2 - y1);
+                    y_char_intersections(end+1) = y_int;
+                end
+            end
+        
+            y_all = [y_char_intersections, y_wall_s];
+        
+            % Initialize force
+            F_pressure_force = 0;
+            
+            % Integrate pressure * annular area between pairs of intersection points
+            for k = 1:length(y_all)-1
+                y_lower = y_all(k);
+                y_upper = y_all(k+1);
+                
+                % Find spike segment index corresponding to y_lower (nearest smaller or equal)
+ 
+                % Use pressure at lower y index
+                p_local = P_all(idx_trunc);
+                idx_trunc = idx_trunc +1;
+                % annular surface element area approximation: dA = 2*pi*r*dy
+                r_local = y_lower;  % approximate radius as y coordinate
+                dA = pi * (y_upper^2 - y_lower^2);
+                
+                % Add pressure force contribution for this segment
+                F_pressure_force = F_pressure_force + (p_local - P_back) * dA;
+            end
+            F_thruster = (mdot * ( V_exit -V_exit_thruster) + F_pressure_force) * cos(flow_angle_end);
+            
+        elseif truncation_pct == 100
+            F_thruster = (mdot * (V_exit - V_exit_thruster) + (P_exit - P_back) * A_exit) * cos(flow_angle_end);
+        end
+        % 2. CONTOUR THRUST (Axial pressure integral)
+        % "integrating the nozzle wall pressure over the surface area projected in the axial direction"
+        F_contour = 0;
+        for i = 1:(N_trunc-1)
+            % Average pressure on element
+            P_avg = 0.5 * (P(i) + P(i+1));
+            
+            % Coordinate differences of spike segment
+            dx = x_spike_trunc(i+1) - x_spike_trunc(i);
+            dy = y_spike_trunc(i+1) - y_spike_trunc(i);
+            
+            % Length of segment (surface element)
+            ds = sqrt(dx^2 + dy^2);
+            
+            % Average radius at segment
+            R_avg = 0.5 * (abs(y_spike_trunc(i)) + abs(y_spike_trunc(i+1)));
+            
+            % Local slope angle: angle between surface element and axial direction
+            slope_angle = atan(abs(dy/dx));  % slope relative to x-axis
+            
+            % Projected axial area element: dA_axial = 2*pi*r*ds*cos(slope_angle)
+            dA_axial = 2 * pi * R_avg * ds * cos(slope_angle);
+            
+            % Add axial component of pressure force on patch
+            F_contour = F_contour + (P_avg - P_back) * dA_axial;
+        end
+        
+        % 3. BASE THRUST
+        % Calculate chamber static pressure for base pressure calc
+        Pc = P0_inlet / (1 + 0.5*(gamma -1)*M_inlet^2)^(gamma/(gamma -1));
+        
+        % Chapman-Korst base pressure model:
+        M_crit = sqrt((gamma + 1)/(2*(gamma -1)));
+        if M_trunc_exit < M_crit
+            P_base = P_back; % subsonic or weak supersonic
+        else
+            Pe_Pc = (1 + 0.5*(gamma -1)*M_trunc_exit^2)^(-gamma/(gamma -1));
+            base_pressure_ratio = max(0.3, 0.5 * Pe_Pc);
+            P_base = base_pressure_ratio * Pc;
+            if P_base < P_back
+                P_base = P_back;
+            end
+        end
+        
+        % Areas
+        R_base = abs(y_spike_trunc(end)) / 2;
+        A_base = pi * R_base^2;
+        
+        F_base = (P_base - P_back) * A_base;
+        
+        % TOTAL THRUST
+        F_total = F_thruster + F_contour - F_base;
+        
+        g0 = 9.80665;
+        
+        % Calculate Isp_z (based on exit mass flow)
+        Isp_z = F_total / (mdot * g0);
+        
+        % Calculate Isp_f (based on fuel mass flow only)
+        mdot_fuel = base_results.performance.mass_flow_fuel;
+        Isp_f = F_total / (mdot_fuel * g0);
+        
+        % Calculate I_tot (total impulse)
+        t_burn = base_results.performance.I_tot / base_results.performance.thrust;
+        I_tot = F_total * t_burn;
+        
+        % Output
+        thrust_results = struct();
+        thrust_results.F_total = F_total;
+        thrust_results.mdot = mdot;
+        thrust_results.Isp_z = Isp_z;
+        thrust_results.Isp_f = Isp_f;
+        thrust_results.I_tot = I_tot;
+        thrust_results.M_exit = M_trunc_exit;
+        thrust_results.P_exit = P_exit;
+        thrust_results.T_exit = T_exit;
+        thrust_results.V_exit = V_exit;
+        thrust_results.truncation_percent = truncation_pct;
+        thrust_results.L_active = L_truncated;
+        
+        thrust_results.profiles.x = x_spike_trunc;
+        thrust_results.profiles.y = y_spike_trunc;
+        thrust_results.profiles.M = M_trunc;
+        thrust_results.profiles.P = P;
+        thrust_results.profiles.T = T;
+        thrust_results.profiles.rho = rho;
+        thrust_results.profiles.V = V;
+    end
+
+    
+end
+
+
+RDE_Analysis_With_CEAM();
